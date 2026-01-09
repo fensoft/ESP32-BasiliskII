@@ -55,8 +55,10 @@ uint32 InterruptFlags = 0;
 void basilisk_loop(void);
 
 // CPU tick counter for timing (used by newcpu.cpp)
-int32 emulated_ticks = 1000;
-static int32 emulated_ticks_quantum = 1000;
+// Higher quantum = less frequent periodic checks = faster emulation
+// But too high can cause choppy video/input response
+int32 emulated_ticks = 5000;
+static int32 emulated_ticks_quantum = 5000;
 
 /*
  *  CPU tick check - called periodically during emulation

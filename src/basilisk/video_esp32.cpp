@@ -18,10 +18,11 @@
 #define DEBUG 1
 #include "debug.h"
 
-// Display configuration
+// Display configuration - 640x360 with 2x pixel doubling for 1280x720 display
 #define MAC_SCREEN_WIDTH  640
-#define MAC_SCREEN_HEIGHT 480
+#define MAC_SCREEN_HEIGHT 360
 #define MAC_SCREEN_DEPTH  VDEPTH_8BIT  // 8-bit indexed color
+#define PIXEL_SCALE       2            // 2x scaling to fill 1280x720
 
 // Frame buffer (allocated in PSRAM)
 static uint8 *frame_buffer = NULL;
@@ -122,7 +123,7 @@ bool VideoInit(bool classic)
     memset(palette_rgb565, 0, 256 * sizeof(uint16));
     
     // Allocate frame buffer in PSRAM
-    // For 640x480 @ 8-bit = 307,200 bytes
+    // For 640x360 @ 8-bit = 230,400 bytes
     frame_buffer_size = MAC_SCREEN_WIDTH * MAC_SCREEN_HEIGHT;
     frame_buffer = (uint8 *)ps_malloc(frame_buffer_size);
     
@@ -217,8 +218,9 @@ void VideoExit(void)
 }
 
 /*
- *  Video refresh - copy Mac frame buffer to display
+ *  Video refresh - copy Mac frame buffer to display with 2x scaling
  *  This is called periodically to update the screen
+ *  Optimized with 32-bit operations for faster palette lookup
  */
 void VideoRefresh(void)
 {
@@ -228,23 +230,35 @@ void VideoRefresh(void)
     uint16 *dest = (uint16 *)canvas->getBuffer();
     if (!dest) return;
     
-    // Convert frame buffer to RGB565 using palette
-    for (int y = 0; y < MAC_SCREEN_HEIGHT; y++) {
-        uint8 *src_row = frame_buffer + (y * MAC_SCREEN_WIDTH);
-        uint16 *dest_row = dest + (y * MAC_SCREEN_WIDTH);
+    // Optimized conversion: process 4 pixels at a time using 32-bit reads
+    int total_pixels = MAC_SCREEN_WIDTH * MAC_SCREEN_HEIGHT;
+    uint8 *src = frame_buffer;
+    uint16 *dst = dest;
+    
+    // Process 4 pixels at a time for better memory bandwidth
+    int chunks = total_pixels >> 2;  // Divide by 4
+    for (int i = 0; i < chunks; i++) {
+        // Read 4 source pixels at once
+        uint32 src4 = *((uint32 *)src);
+        src += 4;
         
-        for (int x = 0; x < MAC_SCREEN_WIDTH; x++) {
-            dest_row[x] = palette_rgb565[src_row[x]];
-        }
+        // Convert each pixel through palette
+        *dst++ = palette_rgb565[src4 & 0xFF];
+        *dst++ = palette_rgb565[(src4 >> 8) & 0xFF];
+        *dst++ = palette_rgb565[(src4 >> 16) & 0xFF];
+        *dst++ = palette_rgb565[(src4 >> 24) & 0xFF];
     }
     
-    // Calculate position to center on display
-    // 1280x720 display, 640x480 content = centered with black bars
-    int x_offset = (display_width - MAC_SCREEN_WIDTH) / 2;
-    int y_offset = (display_height - MAC_SCREEN_HEIGHT) / 2;
+    // Handle remaining pixels (if width*height not divisible by 4)
+    int remaining = total_pixels & 3;
+    for (int i = 0; i < remaining; i++) {
+        *dst++ = palette_rgb565[*src++];
+    }
     
-    // Push canvas to display
-    canvas->pushSprite(x_offset, y_offset);
+    // Push canvas to display with 2x scaling
+    // 640x360 * 2 = 1280x720 exactly fills the display
+    canvas->pushRotateZoom(display_width / 2, display_height / 2, 0.0f, 
+                           (float)PIXEL_SCALE, (float)PIXEL_SCALE);
 }
 
 /*

@@ -35,7 +35,7 @@ using std::vector;
 // Mac and host address space are distinct (virtual addressing)
 #define REAL_ADDRESSING 0
 
-// Not using direct addressing
+// Use bank-based memory access (DIRECT_ADDRESSING requires contiguous memory layout)
 #define DIRECT_ADDRESSING 0
 
 // ROM is write protected in virtual addressing mode
@@ -128,67 +128,56 @@ typedef uae_u32 uaecptr;
 #define HOST_FLOAT_FORMAT IEEE_FLOAT_FORMAT
 
 /*
+ * Inline hints - must be defined before use
+ */
+#define __inline__ inline
+#define ALWAYS_INLINE inline __attribute__((always_inline))
+
+/*
  * Byte swapping functions for little-endian ESP32 accessing big-endian Mac data
- * These are critical for correct emulation!
+ * Using GCC built-in byte swap for optimal performance
  */
 
-// Get 32-bit big-endian value from memory (for Mac memory access)
-static inline uae_u32 do_get_mem_long(uae_u32 *a) {
-    uint8 *b = (uint8 *)a;
-    return ((uae_u32)b[0] << 24) | ((uae_u32)b[1] << 16) | ((uae_u32)b[2] << 8) | (uae_u32)b[3];
+// Byte swap functions using GCC builtins (compile to single instructions)
+static ALWAYS_INLINE uae_u32 do_byteswap_32(uae_u32 v) {
+    return __builtin_bswap32(v);
 }
 
-// Get 16-bit big-endian value from memory
-static inline uae_u32 do_get_mem_word(uae_u16 *a) {
-    uint8 *b = (uint8 *)a;
-    return ((uae_u32)b[0] << 8) | (uae_u32)b[1];
+static ALWAYS_INLINE uae_u16 do_byteswap_16(uae_u16 v) {
+    return __builtin_bswap16(v);
+}
+
+// Get 32-bit big-endian value from memory (optimized with builtin swap)
+static ALWAYS_INLINE uae_u32 do_get_mem_long(uae_u32 *a) {
+    return __builtin_bswap32(*a);
+}
+
+// Get 16-bit big-endian value from memory (optimized with builtin swap)
+static ALWAYS_INLINE uae_u32 do_get_mem_word(uae_u16 *a) {
+    return __builtin_bswap16(*a);
 }
 
 // Get 8-bit value from memory
 #define do_get_mem_byte(a) ((uae_u32)*((uae_u8 *)(a)))
 
-// Put 32-bit big-endian value to memory
-static inline void do_put_mem_long(uae_u32 *a, uae_u32 v) {
-    uint8 *b = (uint8 *)a;
-    b[0] = (uint8)(v >> 24);
-    b[1] = (uint8)(v >> 16);
-    b[2] = (uint8)(v >> 8);
-    b[3] = (uint8)v;
+// Put 32-bit big-endian value to memory (optimized with builtin swap)
+static ALWAYS_INLINE void do_put_mem_long(uae_u32 *a, uae_u32 v) {
+    *a = __builtin_bswap32(v);
 }
 
-// Put 16-bit big-endian value to memory
-static inline void do_put_mem_word(uae_u16 *a, uae_u32 v) {
-    uint8 *b = (uint8 *)a;
-    b[0] = (uint8)(v >> 8);
-    b[1] = (uint8)v;
+// Put 16-bit big-endian value to memory (optimized with builtin swap)
+static ALWAYS_INLINE void do_put_mem_word(uae_u16 *a, uae_u32 v) {
+    *a = __builtin_bswap16((uae_u16)v);
 }
 
 // Put 8-bit value to memory
 #define do_put_mem_byte(a, v) (*(uae_u8 *)(a) = (v))
 
 /*
- * Byte swap functions
- */
-static inline uae_u32 do_byteswap_32(uae_u32 v) {
-    return ((v >> 24) & 0xff) | ((v >> 8) & 0xff00) | 
-           ((v << 8) & 0xff0000) | ((v << 24) & 0xff000000);
-}
-
-static inline uae_u16 do_byteswap_16(uae_u16 v) {
-    return ((v >> 8) & 0xff) | ((v << 8) & 0xff00);
-}
-
-/*
  * Memory bank access function call macros
  */
 #define call_mem_get_func(func, addr) ((*func)(addr))
 #define call_mem_put_func(func, addr, v) ((*func)(addr, v))
-
-/*
- * Inline hints
- */
-#define __inline__ inline
-#define ALWAYS_INLINE inline __attribute__((always_inline))
 
 /*
  * CPU emulation size (0 = normal)
