@@ -81,13 +81,18 @@ public:
 static ESP32_monitor_desc *the_monitor = NULL;
 
 /*
- *  Convert RGB888 to RGB565 (with R/B swap for display)
+ *  Convert RGB888 to swap565_t format for M5GFX canvas buffer
+ *  
+ *  M5GFX uses swap565_t format internally for canvas sprites.
+ *  This format has byte-swapped RGB565 values:
+ *  - Low byte: RRRRRGGG (R in bits 7-3, G high in bits 2-0)
+ *  - High byte: GGGBBBBB (G low in bits 7-5, B in bits 4-0)
  */
 static inline uint16 rgb888_to_rgb565(uint8 r, uint8 g, uint8 b)
 {
-
-    // Swap R and B to match display's BGR565 format
-    return ((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3);
+    // Create swap565_t format for M5GFX canvas buffer
+    // This matches M5GFX's internal swap565() function
+    return ((r >> 3) << 3 | (g >> 5)) | (((g >> 2) << 5 | (b >> 3)) << 8);
 }
 
 /*
