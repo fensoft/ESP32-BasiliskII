@@ -43,7 +43,7 @@ This project runs a **Motorola 68040** emulator that can boot real Macintosh ROM
 
 ## Hardware
 
-### M5Stack Tab5
+### [M5Stack Tab5](https://shop.m5stack.com/products/m5stack-tab5-iot-development-kit-esp32-p4)
 
 The Tab5 features a unique **dual-chip architecture** that makes it ideal for this project:
 
@@ -400,7 +400,7 @@ Look for initialization messages:
 
 - **BasiliskII** by Christian Bauer and contributors — the original open-source 68k Mac emulator
 - **UAE** (Unix Amiga Emulator) — the CPU emulation core
-- **M5Stack** — for the excellent Tab5 hardware and M5Unified/M5GFX libraries
+- **[M5Stack](https://shop.m5stack.com/products/m5stack-tab5-iot-development-kit-esp32-p4)** — for the excellent Tab5 hardware and M5Unified/M5GFX libraries
 - **EspUsbHost** — USB HID support for ESP32
 - **Claude Opus 4.5** (Anthropic) — AI pair programmer that made this port possible
 
