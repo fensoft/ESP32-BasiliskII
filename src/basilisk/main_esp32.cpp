@@ -67,9 +67,9 @@ void basilisk_loop(void);
 // CPU tick counter for timing (used by newcpu.cpp)
 // With video rendering offloaded to Core 0, we can use a much higher quantum
 // Higher quantum = less frequent periodic checks = faster emulation
-// Reduced from 5000 to 20000 since video is now async
-int32 emulated_ticks = 20000;
-static int32 emulated_ticks_quantum = 20000;
+// Increased to 40000 with 15fps video for maximum emulation performance
+int32 emulated_ticks = 40000;
+static int32 emulated_ticks_quantum = 40000;
 
 /*
  *  CPU tick check - called periodically during emulation
@@ -91,7 +91,7 @@ static uint32 last_video_signal = 0;
 
 // Video signal interval (ms) - how often to signal video task
 // The video task runs at its own pace, this just triggers buffer swap
-#define VIDEO_SIGNAL_INTERVAL 33  // ~30 FPS
+#define VIDEO_SIGNAL_INTERVAL 67  // ~15 FPS
 
 // FreeRTOS timer for 60Hz tick
 static TimerHandle_t timer_60hz = NULL;

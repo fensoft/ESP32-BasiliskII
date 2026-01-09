@@ -101,6 +101,7 @@ static const uint8_t HAPPY_MAC_ICON[] = {
 static char selected_disk_path[BOOT_GUI_MAX_PATH] = "";
 static char selected_cdrom_path[BOOT_GUI_MAX_PATH] = "";
 static int selected_ram_mb = 8;  // Default 8MB
+static bool skip_gui = false;    // If true, skip boot GUI and go straight to emulator
 
 static const char* SETTINGS_FILE = "/basilisk_settings.txt";
 
@@ -183,6 +184,9 @@ static void loadSettings(void)
                 selected_ram_mb = 8;  // Default to 8MB if invalid
             }
             Serial.printf("[BOOT_GUI] Loaded RAM: %d MB\n", selected_ram_mb);
+        } else if (key == "skip_gui") {
+            skip_gui = (value == "yes" || value == "true" || value == "1");
+            Serial.printf("[BOOT_GUI] Loaded skip_gui: %s\n", skip_gui ? "yes" : "no");
         }
     }
     
@@ -202,6 +206,7 @@ static void saveSettings(void)
     file.printf("disk=%s\n", selected_disk_path);
     file.printf("cdrom=%s\n", selected_cdrom_path);
     file.printf("ramsize=%d\n", selected_ram_mb);
+    file.printf("skip_gui=%s\n", skip_gui ? "yes" : "no");
     
     file.close();
     Serial.println("[BOOT_GUI] Settings saved");
@@ -895,6 +900,15 @@ bool BootGUI_Init(void)
 {
     Serial.println("[BOOT_GUI] Initializing...");
     
+    // IMPORTANT: Warm up the touch panel
+    // The touch controller needs several update cycles to become responsive
+    Serial.println("[BOOT_GUI] Warming up touch panel...");
+    for (int i = 0; i < 20; i++) {
+        M5.update();
+        delay(50);
+    }
+    Serial.println("[BOOT_GUI] Touch panel ready");
+    
     // Get display dimensions
     SCREEN_WIDTH = M5.Display.width();
     SCREEN_HEIGHT = M5.Display.height();
@@ -933,6 +947,21 @@ void BootGUI_Run(void)
 {
     if (!gui_initialized) {
         Serial.println("[BOOT_GUI] ERROR: GUI not initialized");
+        return;
+    }
+    
+    // Check if we should skip the GUI
+    if (skip_gui) {
+        Serial.println("[BOOT_GUI] skip_gui=yes, skipping boot GUI");
+        Serial.printf("[BOOT_GUI] Using saved settings: disk=%s, ram=%dMB\n", 
+                      selected_disk_path, selected_ram_mb);
+        
+        // Cleanup canvas since we won't use it
+        if (canvas) {
+            canvas->deleteSprite();
+            delete canvas;
+            canvas = nullptr;
+        }
         return;
     }
     

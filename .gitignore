@@ -1,3 +1,6 @@
+# Documentation and ROM files (large binaries)
+docs/
+
 # PlatformIO
 .pio/
 .pioenvs/
