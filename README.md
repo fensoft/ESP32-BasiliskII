@@ -8,14 +8,6 @@ A full port of the **BasiliskII** Macintosh 68k emulator to the ESP32-P4 microco
 ## Screenshots
 
 <p align="center">
-  <img src="screenshots/MacOS753.gif" width="60%" alt="System 7.5.3 Booting"/>
-</p>
-
-<p align="center">
-  <em>System 7.5.3 booting on the M5Stack Tab5</em>
-</p>
-
-<p align="center">
   <img src="screenshots/MacOS8.1_Booted.jpeg" width="45%" alt="Mac OS 8.1 Desktop"/>
   <img src="screenshots/MacOS8.1_About.jpeg" width="45%" alt="Mac OS 8.1 About This Macintosh"/>
 </p>
@@ -26,16 +18,8 @@ A full port of the **BasiliskII** Macintosh 68k emulator to the ESP32-P4 microco
 </p>
 
 <p align="center">
-  <img src="screenshots/Toasters.gif" width="60%" alt="Flying Toasters Screensaver"/>
-</p>
-
-<p align="center">
-  <em>The classic After Dark Flying Toasters screensaver</em>
-</p>
-
-<p align="center">
-  <a href="screenshots/MacOS753_Booting.mov">
-    <img src="https://img.shields.io/badge/▶_Watch_Video-Mac_OS_Booting-red?style=for-the-badge" alt="Watch Boot Video"/>
+  <a href="screenshots.md">
+    <img src="https://img.shields.io/badge/🎬_View_Animations-Boot_Sequence_&_Flying_Toasters-blue?style=for-the-badge" alt="View Animations"/>
   </a>
 </p>
 
