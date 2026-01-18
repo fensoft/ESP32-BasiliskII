@@ -19,9 +19,22 @@
 #include <M5Unified.h>
 #include <EspUsbHost.h>
 #include "esp_attr.h"  // For DRAM_ATTR
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define DEBUG 0
 #include "debug.h"
+
+// ============================================================================
+// Input Task Configuration (runs on Core 0 to offload CPU emulation)
+// ============================================================================
+#define INPUT_TASK_STACK_SIZE 4096
+#define INPUT_TASK_PRIORITY   1
+#define INPUT_TASK_CORE       0  // Run on Core 0, leaving Core 1 for CPU emulation
+#define INPUT_POLL_INTERVAL_MS 16  // 60Hz polling
+
+static TaskHandle_t input_task_handle = NULL;
+static volatile bool input_task_running = false;
 
 // ============================================================================
 // USB HID Scancode to Mac ADB Keycode Translation Table
@@ -634,6 +647,44 @@ static void updateKeyboardLEDs(void)
 }
 
 // ============================================================================
+// Input Task (runs on Core 0)
+// ============================================================================
+
+/*
+ *  Input polling task - runs on Core 0 independently of CPU emulation
+ *  This offloads the ~2.3ms USB host processing from the CPU emulation loop
+ */
+static void inputTask(void *param)
+{
+    (void)param;
+    Serial.println("[INPUT] Input task started on Core 0");
+    
+    const TickType_t poll_interval = pdMS_TO_TICKS(INPUT_POLL_INTERVAL_MS);
+    
+    while (input_task_running) {
+        // Update M5 library (touch, buttons, etc.)
+        M5.update();
+        
+        // Process touch input
+        processTouchInput();
+        
+        // Process USB Host events (this is the slow part ~2ms)
+        if (usbHost != NULL) {
+            usbHost->task();
+        }
+        
+        // Update keyboard LEDs (Caps Lock, etc.)
+        updateKeyboardLEDs();
+        
+        // Wait until next poll interval
+        vTaskDelay(poll_interval);
+    }
+    
+    Serial.println("[INPUT] Input task exiting");
+    vTaskDelete(NULL);
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
@@ -673,12 +724,40 @@ bool InputInit(void)
         Serial.println("[INPUT] ERROR: Failed to create USB Host instance");
     }
     
+    // Start input polling task on Core 0
+    // This offloads input processing from the CPU emulation loop
+    input_task_running = true;
+    BaseType_t result = xTaskCreatePinnedToCore(
+        inputTask,
+        "InputTask",
+        INPUT_TASK_STACK_SIZE,
+        NULL,
+        INPUT_TASK_PRIORITY,
+        &input_task_handle,
+        INPUT_TASK_CORE
+    );
+    
+    if (result != pdPASS) {
+        Serial.println("[INPUT] ERROR: Failed to create input task");
+        input_task_running = false;
+    } else {
+        Serial.printf("[INPUT] Input task created on Core %d\n", INPUT_TASK_CORE);
+    }
+    
     return true;
 }
 
 void InputExit(void)
 {
     Serial.println("[INPUT] Shutting down input subsystem");
+    
+    // Stop input task first
+    if (input_task_running) {
+        input_task_running = false;
+        // Give task time to exit gracefully
+        vTaskDelay(pdMS_TO_TICKS(50));
+        input_task_handle = NULL;
+    }
     
     // Release any held buttons
     if (touch_was_pressed) {

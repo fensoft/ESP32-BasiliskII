@@ -72,16 +72,78 @@ void basilisk_loop(void);
 int32 emulated_ticks = 40000;
 static int32 emulated_ticks_quantum = 40000;
 
+// ============================================================================
+// IPS (Instructions Per Second) Monitoring
+// ============================================================================
+// These counters track emulated 68k instructions for performance measurement
+static volatile uint64_t ips_total_instructions = 0;    // Total instructions executed
+static volatile uint64_t ips_last_instructions = 0;     // Instructions at last report
+static volatile uint32_t ips_last_report_time = 0;      // Time of last IPS report
+static volatile uint32_t ips_current = 0;               // Most recent IPS measurement
+#define IPS_REPORT_INTERVAL_MS 5000                     // Report IPS every 5 seconds
+
 /*
  *  CPU tick check - called periodically during emulation
+ *  
+ *  This is called every emulated_ticks_quantum instructions (40000 by default).
+ *  We use this to:
+ *  1. Count instructions for IPS monitoring
+ *  2. Handle periodic tasks (60Hz, video, input, etc.)
  */
 void cpu_do_check_ticks(void)
 {
+    // Count instructions executed since last tick check
+    // This is the number of instructions in one quantum
+    ips_total_instructions += emulated_ticks_quantum;
+    
     // Call basilisk_loop to handle periodic tasks
     basilisk_loop();
     
     // Reset tick counter
     emulated_ticks = emulated_ticks_quantum;
+}
+
+/*
+ *  Report IPS (Instructions Per Second) statistics
+ *  Called from basilisk_loop periodically
+ */
+static void reportIPSStats(uint32 current_time)
+{
+    if (current_time - ips_last_report_time >= IPS_REPORT_INTERVAL_MS) {
+        uint64_t instructions_delta = ips_total_instructions - ips_last_instructions;
+        uint32_t time_delta_ms = current_time - ips_last_report_time;
+        
+        if (time_delta_ms > 0) {
+            // Calculate IPS (instructions per second)
+            // Use 64-bit math to avoid overflow
+            ips_current = (uint32_t)((instructions_delta * 1000ULL) / time_delta_ms);
+            
+            // Report in MIPS (millions of instructions per second) for readability
+            float mips = ips_current / 1000000.0f;
+            
+            Serial.printf("[IPS] %u instructions/sec (%.2f MIPS), total: %llu\n", 
+                          ips_current, mips, ips_total_instructions);
+        }
+        
+        ips_last_instructions = ips_total_instructions;
+        ips_last_report_time = current_time;
+    }
+}
+
+/*
+ *  Get current IPS measurement (for external use)
+ */
+uint32_t getEmulatorIPS(void)
+{
+    return ips_current;
+}
+
+/*
+ *  Get total instructions executed (for external use)
+ */
+uint64_t getEmulatorTotalInstructions(void)
+{
+    return ips_total_instructions;
 }
 
 // Global emulator state
@@ -98,24 +160,19 @@ static uint32 last_disk_flush_time = 0;
 // Disk flush interval (ms) - how often to flush write buffer to SD card
 #define DISK_FLUSH_INTERVAL 2000  // 2 seconds
 
-// Input polling interval (ms) - poll at 60Hz instead of every tick
-// This reduces CPU overhead while maintaining responsive input
-#define INPUT_POLL_INTERVAL 16  // ~60Hz
-
 // FreeRTOS timer for 60Hz tick
 static TimerHandle_t timer_60hz = NULL;
 
-// Input polling state
-static uint32 last_input_poll_time = 0;
+// NOTE: Input polling is now handled by a dedicated task on Core 0
+// See input_esp32.cpp inputTask()
 
 // ============================================================================
 // Performance profiling counters for main loop
 // ============================================================================
 static uint32 perf_loop_count = 0;           // Number of basilisk_loop calls
-static uint32 perf_input_us = 0;             // Time spent in input polling
-static uint32 perf_input_count = 0;          // Number of input polls
 static uint32 perf_flush_us = 0;             // Time spent in disk flush
 static uint32 perf_flush_count = 0;          // Number of flushes
+// NOTE: Input polling stats removed - input now runs on Core 0 task
 static uint32 perf_main_last_report = 0;     // Last time stats were printed
 #define PERF_MAIN_REPORT_INTERVAL_MS 5000    // Report every 5 seconds
 
@@ -494,18 +551,14 @@ static void reportMainPerfStats(uint32 current_time)
         
         if (perf_loop_count > 0) {
             uint32 loops_per_sec = (perf_loop_count * 1000) / PERF_MAIN_REPORT_INTERVAL_MS;
-            Serial.printf("[MAIN PERF] loops/sec=%u input_polls=%u input_avg=%uus flushes=%u flush_avg=%uus\n",
+            Serial.printf("[MAIN PERF] loops/sec=%u flushes=%u flush_avg=%uus\n",
                           loops_per_sec,
-                          perf_input_count,
-                          perf_input_count > 0 ? perf_input_us / perf_input_count : 0,
                           perf_flush_count,
                           perf_flush_count > 0 ? perf_flush_us / perf_flush_count : 0);
         }
         
         // Reset counters
         perf_loop_count = 0;
-        perf_input_us = 0;
-        perf_input_count = 0;
         perf_flush_us = 0;
         perf_flush_count = 0;
     }
@@ -518,8 +571,8 @@ static void reportMainPerfStats(uint32 current_time)
  *  With dual-core optimization:
  *  - 60Hz tick is polled here (safer than async timer)
  *  - Video refresh is handled by video task on Core 0 (doesn't block here)
- *  - Input polling happens at 60Hz (not every tick) to reduce overhead
- *  - This function is lightweight - no rendering happens here
+ *  - Input polling is handled by input task on Core 0 (doesn't block here)
+ *  - This function is lightweight - no rendering or input polling happens here
  */
 void basilisk_loop(void)
 {
@@ -557,22 +610,15 @@ void basilisk_loop(void)
         perf_flush_count++;
     }
     
-    // Poll for input events at 60Hz (not every tick)
-    // This reduces CPU overhead while maintaining responsive input
-    // Input is still polled at 60Hz which is sufficient for UI responsiveness
-    if (current_time - last_input_poll_time >= INPUT_POLL_INTERVAL) {
-        last_input_poll_time = current_time;
-        
-        uint32 t0 = micros();
-        M5.update();
-        InputPoll();
-        uint32 t1 = micros();
-        perf_input_us += (t1 - t0);
-        perf_input_count++;
-    }
+    // NOTE: Input polling (M5.update + InputPoll) is now handled by a dedicated
+    // task on Core 0, removing ~2.3ms of blocking time from this loop.
+    // See input_esp32.cpp inputTask()
     
     // Report performance stats periodically
     reportMainPerfStats(current_time);
+    
+    // Report IPS stats periodically
+    reportIPSStats(current_time);
     
     // Yield to allow FreeRTOS tasks to run
     taskYIELD();

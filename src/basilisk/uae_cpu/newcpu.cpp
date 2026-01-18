@@ -1445,18 +1445,54 @@ int m68k_do_specialties (void)
 
 // Place the main CPU execution loop in internal RAM for faster execution
 // This is the hottest path in the emulator - runs for every 68k instruction
+//
+// OPTIMIZATION: The inner loop executes multiple instructions before checking
+// for ticks and special flags. This reduces overhead significantly.
+// The BATCH_SIZE controls how many instructions run before checking - higher
+// values improve performance but reduce interrupt responsiveness.
+// 32 instructions = good balance of performance vs responsiveness
+// Higher values (64, 128) give diminishing returns but less responsive interrupts
+#define EXEC_BATCH_SIZE 32
+
+// External tick counter (defined in main_esp32.cpp via newcpu.h)
+extern int32 emulated_ticks;
+extern void cpu_do_check_ticks(void);
+
 #ifdef ARDUINO
 IRAM_ATTR
 #endif
 void m68k_do_execute (void)
 {
 	for (;;) {
-		uae_u32 opcode = GET_OPCODE;
+		// Execute a batch of instructions before checking ticks/flags
+		// This reduces the overhead of the tick check from every instruction
+		// to every EXEC_BATCH_SIZE instructions
+		int batch_count = EXEC_BATCH_SIZE;
+		int instructions_executed = 0;
+		
+		do {
+			uae_u32 opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
-		m68k_record_step(m68k_getpc());
+			m68k_record_step(m68k_getpc());
 #endif
-		(*cpufunctbl[opcode])(opcode);
-		cpu_check_ticks();
+			(*cpufunctbl[opcode])(opcode);
+			instructions_executed++;
+			
+			// Early exit if special flags are set (interrupts, etc.)
+			// This check is very fast (single memory read + compare)
+			if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+				break;
+			}
+		} while (--batch_count > 0);
+		
+		// Decrement tick counter by number of instructions actually executed
+		// This maintains accurate instruction counting for IPS monitoring
+		emulated_ticks -= instructions_executed;
+		if (emulated_ticks <= 0) {
+			cpu_do_check_ticks();
+		}
+		
+		// Handle special conditions (interrupts, trace, etc.)
 		if (SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN)) {
 			if (m68k_do_specialties())
 				return;
