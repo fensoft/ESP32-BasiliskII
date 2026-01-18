@@ -18,6 +18,7 @@
 
 #include <M5Unified.h>
 #include <EspUsbHost.h>
+#include "esp_attr.h"  // For DRAM_ATTR
 
 #define DEBUG 0
 #include "debug.h"
@@ -36,10 +37,7 @@
 
 // USB HID to Mac ADB keycode translation - in internal SRAM for fast lookup
 // Accessed on every keystroke
-#ifdef ARDUINO
-__attribute__((section(".dram0.data")))
-#endif
-static const uint8_t usb_to_mac_keycode[256] = {
+DRAM_ATTR static const uint8_t usb_to_mac_keycode[256] = {
     // 0x00-0x03: Reserved/Error codes
     0xFF, 0xFF, 0xFF, 0xFF,
     

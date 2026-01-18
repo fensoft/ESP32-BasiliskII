@@ -6,18 +6,17 @@
  *  Dual-core optimized: Video rendering runs on Core 0, CPU emulation on Core 1
  *  
  *  OPTIMIZATIONS:
- *  1. Writes directly to DSI hardware framebuffer with 2x2 scaling
- *  2. Triple buffering - eliminates race conditions between CPU and video task
- *     - mac_frame_buffer: CPU writes here (owned by emulation)
- *     - snapshot_buffer: Atomic copy taken at start of video frame
- *     - compare_buffer: What we rendered last frame (for dirty detection)
- *     - Fast pointer swap after each frame (no data copy needed)
- *  3. Tile-based dirty tracking - only updates changed screen regions
+ *  1. 8-bit indexed frame buffer - minimizes PSRAM bandwidth
+ *     - mac_frame_buffer: CPU writes here (8-bit indexed, 230KB)
+ *     - Conversion to RGB565 happens at display write time
+ *  2. Write-time dirty tracking - CPU marks tiles dirty as it writes
+ *     - No per-frame comparison needed (eliminates ~460KB PSRAM traffic)
+ *     - Dirty tiles tracked via atomic bitmap operations
+ *  3. Tile-based partial updates - only updates changed screen regions
  *     - Screen divided into 16x9 grid of 40x40 pixel tiles (144 tiles total)
- *     - Compares snapshot vs compare using 32-bit word comparisons
  *     - Only renders and pushes tiles that have changed
  *     - Falls back to full update if >80% of tiles are dirty (reduces API overhead)
- *     - Typical Mac OS usage sees 60-90% reduction in video rendering CPU time
+ *     - Working buffers placed in internal SRAM for fast access
  *  
  *  TUNING PARAMETERS (defined below):
  *  - TILE_WIDTH/TILE_HEIGHT: Tile size in Mac pixels (40x40 default)
@@ -43,6 +42,9 @@
 
 // Watchdog timer control
 #include "esp_task_wdt.h"
+
+// ESP-IDF memory attributes (DRAM_ATTR for internal SRAM placement)
+#include "esp_attr.h"
 
 // Cache control for DMA visibility
 #if __has_include(<esp_cache.h>)
@@ -91,10 +93,6 @@
 static uint8 *mac_frame_buffer = NULL;
 static uint32 frame_buffer_size = 0;
 
-// Direct access to DSI hardware framebuffer
-static uint16 *dsi_framebuffer = NULL;
-static uint32 dsi_framebuffer_size = 0;
-
 // Frame synchronization
 static volatile bool frame_ready = false;
 static portMUX_TYPE frame_spinlock = portMUX_INITIALIZER_UNLOCKED;
@@ -105,35 +103,24 @@ static volatile bool video_task_running = false;
 
 // Palette (256 RGB565 entries) - in internal SRAM for fast access during rendering
 // This is accessed for every pixel during video conversion
-#ifdef ARDUINO
-__attribute__((section(".dram0.data"))) static uint16 palette_rgb565[256];
-#else
-static uint16 palette_rgb565[256];
-#endif
+DRAM_ATTR static uint16 palette_rgb565[256];
 
-// Triple buffering for race-free dirty tracking
-// - mac_frame_buffer: CPU writes here (owned by emulation, can't change)
-// - snapshot_buffer: Atomic copy of mac_frame_buffer taken at start of video frame
-// - compare_buffer: What we rendered/compared against last frame
-// This eliminates race conditions where CPU writes during our compare/render
-static uint8 *snapshot_buffer = NULL;                        // Current frame snapshot (in PSRAM)
-static uint8 *compare_buffer = NULL;                         // Previous rendered frame (in PSRAM)
 // Dirty tile bitmap - in internal SRAM for fast access during video frame processing
-#ifdef ARDUINO
-__attribute__((section(".dram0.data")))
-#endif
-static uint32 dirty_tiles[(TOTAL_TILES + 31) / 32];          // Bitmap of dirty tiles (read by video task)
+DRAM_ATTR static uint32 dirty_tiles[(TOTAL_TILES + 31) / 32];          // Bitmap of dirty tiles (read by video task)
 
 // Write-time dirty tracking bitmap - marked when CPU writes to framebuffer
 // This is double-buffered to avoid race conditions between CPU writes and video task reads
-#ifdef ARDUINO
-__attribute__((section(".dram0.data")))
-#endif
-static uint32 write_dirty_tiles[(TOTAL_TILES + 31) / 32];    // Tiles dirtied by CPU writes
+DRAM_ATTR static uint32 write_dirty_tiles[(TOTAL_TILES + 31) / 32];    // Tiles dirtied by CPU writes
+
+// Row buffer for streaming full-frame renders
+// Processes 2 Mac rows at a time (becomes 4 display rows with 2x scaling)
+// Size: 1280 pixels * 4 rows * 2 bytes = 10,240 bytes (10KB)
+// In internal SRAM for fast access during full-frame renders
+#define STREAMING_ROW_COUNT 4
+DRAM_ATTR static uint16 streaming_row_buffer[DISPLAY_WIDTH * STREAMING_ROW_COUNT];
 
 static volatile bool force_full_update = true;               // Force full update on first frame or palette change
 static int dirty_tile_count = 0;                             // Count of dirty tiles for threshold check
-static volatile bool use_write_dirty_tracking = true;        // Use write-time dirty tracking (faster)
 
 // Display dimensions (from M5.Display)
 static int display_width = 0;
@@ -153,10 +140,8 @@ static volatile uint8 current_pixel_mask = 0xFF;  // Mask for extracting pixel v
 // ============================================================================
 // Performance profiling counters (lightweight, always enabled)
 // ============================================================================
-static volatile uint32_t perf_snapshot_us = 0;      // Time to take frame snapshot
 static volatile uint32_t perf_detect_us = 0;        // Time to detect dirty tiles
-static volatile uint32_t perf_render_us = 0;        // Time to render frame
-static volatile uint32_t perf_push_us = 0;          // Time to push to display
+static volatile uint32_t perf_render_us = 0;        // Time to render and push frame
 static volatile uint32_t perf_frame_count = 0;      // Frames rendered
 static volatile uint32_t perf_partial_count = 0;    // Partial updates
 static volatile uint32_t perf_full_count = 0;       // Full updates
@@ -481,96 +466,6 @@ static inline uint8 getPackedPixel(const uint8 *fb, int x, int y, uint32 bpr, vi
 }
 
 /*
- *  Flush CPU cache to ensure DMA sees our writes
- *  Note: For PSRAM allocated with ps_malloc, we use writePixels which handles
- *  the transfer internally. The cache flush is only needed for true DMA buffers.
- *  Since ps_malloc doesn't guarantee cache alignment, we skip the cache flush
- *  when using the writePixels path.
- */
-static inline void flushCacheForDMA(void *buffer, size_t size)
-{
-    // Skip cache flush - writePixels handles the transfer properly
-    // and our buffer may not be cache-line aligned
-    (void)buffer;
-    (void)size;
-}
-
-/*
- *  Detect which tiles have changed between current and previous frame
- *  Uses 32-bit word comparisons for speed
- *  Returns the number of dirty tiles found
- *  
- *  Handles packed pixel modes by calculating correct byte offsets using
- *  current_bytes_per_row and current_pixels_per_byte.
- */
-static int detectDirtyTiles(uint8 *current, uint8 *previous)
-{
-    memset(dirty_tiles, 0, sizeof(dirty_tiles));
-    int count = 0;
-    
-    // Get current bytes per row and pixels per byte (volatile)
-    uint32 bpr = current_bytes_per_row;
-    int ppb = current_pixels_per_byte;
-    
-    // Calculate bytes per tile row based on current mode
-    // In packed modes, TILE_WIDTH pixels takes fewer bytes
-    int bytes_per_tile_row = TILE_WIDTH / ppb;
-    if (bytes_per_tile_row < 4) bytes_per_tile_row = 4;  // Minimum for 32-bit comparison
-    
-    for (int ty = 0; ty < TILES_Y; ty++) {
-        for (int tx = 0; tx < TILES_X; tx++) {
-            int tile_idx = ty * TILES_X + tx;
-            bool is_dirty = false;
-            
-            // Calculate pixel and byte positions for this tile
-            int tile_pixel_x = tx * TILE_WIDTH;
-            int tile_byte_x = tile_pixel_x / ppb;  // Starting byte column for this tile
-            
-            // Compare tile row by row
-            for (int row = 0; row < TILE_HEIGHT; row++) {
-                if (is_dirty) break;  // Early exit once we know tile is dirty
-                
-                int y = ty * TILE_HEIGHT + row;
-                int row_offset = y * bpr + tile_byte_x;
-                
-                // Compare bytes for this tile row
-                uint8 *curr = current + row_offset;
-                uint8 *prev = previous + row_offset;
-                
-                // Compare using 32-bit words where possible
-                int bytes_to_compare = bytes_per_tile_row;
-                int words = bytes_to_compare / 4;
-                
-                for (int w = 0; w < words; w++) {
-                    if (((uint32 *)curr)[w] != ((uint32 *)prev)[w]) {
-                        is_dirty = true;
-                        break;
-                    }
-                }
-                
-                // Compare remaining bytes
-                if (!is_dirty) {
-                    int remaining = bytes_to_compare % 4;
-                    for (int b = words * 4; b < words * 4 + remaining; b++) {
-                        if (curr[b] != prev[b]) {
-                            is_dirty = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            if (is_dirty) {
-                dirty_tiles[tile_idx / 32] |= (1 << (tile_idx % 32));
-                count++;
-            }
-        }
-    }
-    
-    return count;
-}
-
-/*
  *  Check if a specific tile is marked as dirty
  */
 static inline bool isTileDirty(int tile_idx)
@@ -589,7 +484,6 @@ static inline bool isTileDirty(int tile_idx)
  */
 void VideoMarkDirtyOffset(uint32 offset)
 {
-    if (!use_write_dirty_tracking) return;
     if (offset >= frame_buffer_size) return;
     
     // Get current bytes per row (volatile)
@@ -637,7 +531,6 @@ void VideoMarkDirtyOffset(uint32 offset)
  */
 void VideoMarkDirtyRange(uint32 offset, uint32 size)
 {
-    if (!use_write_dirty_tracking) return;
     if (offset >= frame_buffer_size) return;
     
     // Clamp size to framebuffer bounds
@@ -721,178 +614,6 @@ static int collectWriteDirtyTiles(void)
     }
     
     return count;
-}
-
-/*
- *  Take an atomic snapshot of the mac_frame_buffer
- *  This ensures we have a consistent frame to work with while CPU continues writing
- */
-static void takeFrameSnapshot(void)
-{
-    memcpy(snapshot_buffer, mac_frame_buffer, frame_buffer_size);
-}
-
-/*
- *  Swap snapshot and compare buffers (pointer swap - very fast)
- *  After rendering, the snapshot becomes the new compare buffer for next frame
- */
-static void swapBuffers(void)
-{
-    uint8 *temp = compare_buffer;
-    compare_buffer = snapshot_buffer;
-    snapshot_buffer = temp;
-}
-
-/*
- *  Render a single tile from Mac framebuffer to DSI framebuffer with 2x2 scaling
- *  
- *  NOTE: This function is LEGACY CODE and not currently used in the active rendering path.
- *  The active path uses snapshotTile() + renderTileFromSnapshot() instead.
- *  This version assumes 8-bit mode and does not support packed pixel modes.
- *  Kept for reference only.
- *  
- *  @param src_buffer   Mac framebuffer (8-bit indexed)
- *  @param tile_x       Tile column index (0 to TILES_X-1)
- *  @param tile_y       Tile row index (0 to TILES_Y-1)
- *  @param local_palette  Pre-copied palette for thread safety
- */
-static void renderTile(uint8 *src_buffer, int tile_x, int tile_y, uint16 *local_palette)
-{
-    // Calculate source and destination positions
-    int src_start_x = tile_x * TILE_WIDTH;
-    int src_start_y = tile_y * TILE_HEIGHT;
-    int dst_start_x = src_start_x * PIXEL_SCALE;
-    int dst_start_y = src_start_y * PIXEL_SCALE;
-    
-    // Process each row of the tile
-    for (int row = 0; row < TILE_HEIGHT; row++) {
-        int src_y = src_start_y + row;
-        int dst_y = dst_start_y + (row * PIXEL_SCALE);
-        
-        // Source row pointer
-        uint8 *src = src_buffer + src_y * MAC_SCREEN_WIDTH + src_start_x;
-        
-        // Destination row pointers (two rows for 2x vertical scaling)
-        uint16 *dst_row0 = dsi_framebuffer + dst_y * DISPLAY_WIDTH + dst_start_x;
-        uint16 *dst_row1 = dst_row0 + DISPLAY_WIDTH;
-        
-        // Process 4 pixels at a time for better memory bandwidth
-        int x = 0;
-        for (; x < TILE_WIDTH - 3; x += 4) {
-            // Read 4 source pixels at once (32-bit read)
-            uint32 src4 = *((uint32 *)src);
-            src += 4;
-            
-            // Convert each pixel through palette and write 2x2 scaled
-            uint16 c0 = local_palette[src4 & 0xFF];
-            uint16 c1 = local_palette[(src4 >> 8) & 0xFF];
-            uint16 c2 = local_palette[(src4 >> 16) & 0xFF];
-            uint16 c3 = local_palette[(src4 >> 24) & 0xFF];
-            
-            // Write to row 0 (2 pixels per source pixel)
-            dst_row0[0] = c0; dst_row0[1] = c0;
-            dst_row0[2] = c1; dst_row0[3] = c1;
-            dst_row0[4] = c2; dst_row0[5] = c2;
-            dst_row0[6] = c3; dst_row0[7] = c3;
-            
-            // Write to row 1 (duplicate of row 0)
-            dst_row1[0] = c0; dst_row1[1] = c0;
-            dst_row1[2] = c1; dst_row1[3] = c1;
-            dst_row1[4] = c2; dst_row1[5] = c2;
-            dst_row1[6] = c3; dst_row1[7] = c3;
-            
-            dst_row0 += 8;
-            dst_row1 += 8;
-        }
-        
-        // Handle remaining pixels (TILE_WIDTH=40 is divisible by 4, so this rarely runs)
-        for (; x < TILE_WIDTH; x++) {
-            uint16 c = local_palette[*src++];
-            dst_row0[0] = c; dst_row0[1] = c;
-            dst_row1[0] = c; dst_row1[1] = c;
-            dst_row0 += 2;
-            dst_row1 += 2;
-        }
-    }
-}
-
-/*
- *  Render a single tile directly to a contiguous buffer (for partial updates)
- *  
- *  NOTE: This function is LEGACY CODE and not currently used in the active rendering path.
- *  The active path uses snapshotTile() + renderTileFromSnapshot() instead.
- *  This version assumes 8-bit mode and does not support packed pixel modes.
- *  Kept for reference only.
- *  
- *  @param src_buffer      Mac framebuffer (8-bit indexed)
- *  @param tile_x          Tile column index (0 to TILES_X-1)
- *  @param tile_y          Tile row index (0 to TILES_Y-1)
- *  @param local_palette   Pre-copied palette for thread safety
- *  @param out_buffer      Output buffer (contiguous, tile_pixel_width * tile_pixel_height pixels)
- */
-static void renderTileToBuffer(uint8 *src_buffer, int tile_x, int tile_y, 
-                                uint16 *local_palette, uint16 *out_buffer)
-{
-    // Calculate source position in Mac framebuffer
-    int src_start_x = tile_x * TILE_WIDTH;
-    int src_start_y = tile_y * TILE_HEIGHT;
-    int tile_pixel_width = TILE_WIDTH * PIXEL_SCALE;  // 80 pixels
-    
-    // Output buffer pointer
-    uint16 *out = out_buffer;
-    
-    // Process each row of the Mac tile
-    for (int row = 0; row < TILE_HEIGHT; row++) {
-        int src_y = src_start_y + row;
-        
-        // Source row pointer
-        uint8 *src = src_buffer + src_y * MAC_SCREEN_WIDTH + src_start_x;
-        
-        // Output row pointers (two rows for 2x vertical scaling)
-        uint16 *dst_row0 = out;
-        uint16 *dst_row1 = out + tile_pixel_width;
-        
-        // Process 4 pixels at a time for better memory bandwidth
-        int x = 0;
-        for (; x < TILE_WIDTH - 3; x += 4) {
-            // Read 4 source pixels at once (32-bit read)
-            uint32 src4 = *((uint32 *)src);
-            src += 4;
-            
-            // Convert each pixel through palette and write 2x2 scaled
-            uint16 c0 = local_palette[src4 & 0xFF];
-            uint16 c1 = local_palette[(src4 >> 8) & 0xFF];
-            uint16 c2 = local_palette[(src4 >> 16) & 0xFF];
-            uint16 c3 = local_palette[(src4 >> 24) & 0xFF];
-            
-            // Write to row 0 (2 pixels per source pixel)
-            dst_row0[0] = c0; dst_row0[1] = c0;
-            dst_row0[2] = c1; dst_row0[3] = c1;
-            dst_row0[4] = c2; dst_row0[5] = c2;
-            dst_row0[6] = c3; dst_row0[7] = c3;
-            
-            // Write to row 1 (duplicate of row 0)
-            dst_row1[0] = c0; dst_row1[1] = c0;
-            dst_row1[2] = c1; dst_row1[3] = c1;
-            dst_row1[4] = c2; dst_row1[5] = c2;
-            dst_row1[6] = c3; dst_row1[7] = c3;
-            
-            dst_row0 += 8;
-            dst_row1 += 8;
-        }
-        
-        // Handle remaining pixels (TILE_WIDTH=40 is divisible by 4, so this rarely runs)
-        for (; x < TILE_WIDTH; x++) {
-            uint16 c = local_palette[*src++];
-            dst_row0[0] = c; dst_row0[1] = c;
-            dst_row1[0] = c; dst_row1[1] = c;
-            dst_row0 += 2;
-            dst_row1 += 2;
-        }
-        
-        // Move output pointer by 2 rows (2x vertical scaling)
-        out += tile_pixel_width * 2;
-    }
 }
 
 /*
@@ -1044,10 +765,12 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
 {
     // Temporary buffer for one tile's source data (40x40 = 1600 bytes)
     // Static to avoid stack allocation on each call
-    static uint8 tile_snapshot[TILE_WIDTH * TILE_HEIGHT];
+    // In internal SRAM for fast access during partial updates
+    DRAM_ATTR static uint8 tile_snapshot[TILE_WIDTH * TILE_HEIGHT];
     
     // Temporary buffer for one tile's RGB565 output (80x80 = 12,800 bytes)
-    static uint16 tile_buffer[TILE_WIDTH * PIXEL_SCALE * TILE_HEIGHT * PIXEL_SCALE];
+    // In internal SRAM for fast access during partial updates
+    DRAM_ATTR static uint16 tile_buffer[TILE_WIDTH * PIXEL_SCALE * TILE_HEIGHT * PIXEL_SCALE];
     
     int tile_pixel_width = TILE_WIDTH * PIXEL_SCALE;
     int tile_pixel_height = TILE_HEIGHT * PIXEL_SCALE;
@@ -1086,156 +809,115 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
 }
 
 /*
- *  Render frame buffer directly to DSI hardware framebuffer with 2x2 scaling
- *  Called from video task on Core 0
+ *  Render frame buffer directly to display using streaming (no intermediate PSRAM buffer)
  *  
- *  This writes directly to the MIPI-DSI DMA buffer which is continuously
- *  streamed to the display by hardware - no explicit push call needed.
+ *  This optimized version eliminates the 1.8MB dsi_framebuffer by:
+ *  1. Processing 2 Mac rows at a time (becomes 4 display rows with 2x scaling)
+ *  2. Converting 8-bit indexed to RGB565 into internal SRAM row buffer
+ *  3. Immediately pushing to display via M5GFX
+ *  
+ *  PSRAM traffic: ~230KB read (mac_frame_buffer only)
+ *  vs old method: ~230KB read + 1.8MB write + 1.8MB read = ~3.8MB
  *  
  *  Supports all bit depths (1/2/4/8-bit) by decoding packed pixels first.
  */
-static void renderFrameToDSI(uint8 *src_buffer)
+static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
 {
-    if (!src_buffer || !dsi_framebuffer) return;
-    
-    // Take a snapshot of the palette (thread-safe)
-    uint16 local_palette[256];
-    portENTER_CRITICAL(&frame_spinlock);
-    memcpy(local_palette, palette_rgb565, 256 * sizeof(uint16));
-    portEXIT_CRITICAL(&frame_spinlock);
+    if (!src_buffer) return;
     
     // Get current depth and bytes per row (volatile, so copy locally)
     video_depth depth = current_depth;
     uint32 bpr = current_bytes_per_row;
     
     // Row decode buffer for packed pixel modes
-    // Static to avoid stack allocation on each call
-    static uint8 decoded_row[MAC_SCREEN_WIDTH];
+    // In internal SRAM for fast access during rendering
+    DRAM_ATTR static uint8 decoded_row[MAC_SCREEN_WIDTH];
     
-    // Process source buffer line by line
-    // For each Mac line, write two display lines (2x vertical scaling)
-    // For each Mac pixel, write two display pixels (2x horizontal scaling)
+    M5.Display.startWrite();
     
-    for (int y = 0; y < MAC_SCREEN_HEIGHT; y++) {
-        // Get source row pointer
-        uint8 *src_row = src_buffer + y * bpr;
+    // Process 2 Mac rows at a time (produces 4 display rows with 2x scaling)
+    // This matches the streaming_row_buffer size
+    for (int mac_y = 0; mac_y < MAC_SCREEN_HEIGHT; mac_y += 2) {
+        uint16 *out = streaming_row_buffer;
         
-        // Decode the row if needed (converts packed pixels to 8-bit indices)
-        uint8 *pixel_row;
-        if (depth == VDEPTH_8BIT) {
-            // 8-bit mode: direct access, no decoding needed
-            pixel_row = src_row;
-        } else {
-            // Packed mode: decode to 8-bit indices
-            decodePackedRow(src_row, decoded_row, MAC_SCREEN_WIDTH, depth);
-            pixel_row = decoded_row;
+        // Process 2 Mac rows
+        for (int row_offset = 0; row_offset < 2; row_offset++) {
+            int y = mac_y + row_offset;
+            if (y >= MAC_SCREEN_HEIGHT) break;
+            
+            // Get source row pointer
+            uint8 *src_row = src_buffer + y * bpr;
+            
+            // Decode the row if needed (converts packed pixels to 8-bit indices)
+            uint8 *pixel_row;
+            if (depth == VDEPTH_8BIT) {
+                // 8-bit mode: direct access, no decoding needed
+                pixel_row = src_row;
+            } else {
+                // Packed mode: decode to 8-bit indices
+                decodePackedRow(src_row, decoded_row, MAC_SCREEN_WIDTH, depth);
+                pixel_row = decoded_row;
+            }
+            
+            // Output row pointers for the two scaled display rows
+            uint16 *dst_row0 = out;
+            uint16 *dst_row1 = out + DISPLAY_WIDTH;
+            
+            // Process 4 decoded pixels at a time for better memory bandwidth
+            int x = 0;
+            for (; x < MAC_SCREEN_WIDTH - 3; x += 4) {
+                // Read 4 decoded pixels at once (32-bit read from 8-bit indices)
+                uint32 src4 = *((uint32 *)(pixel_row + x));
+                
+                // Convert each pixel through palette and write 2x2 scaled
+                uint16 c0 = local_palette[src4 & 0xFF];
+                uint16 c1 = local_palette[(src4 >> 8) & 0xFF];
+                uint16 c2 = local_palette[(src4 >> 16) & 0xFF];
+                uint16 c3 = local_palette[(src4 >> 24) & 0xFF];
+                
+                // Write to row 0 (2 pixels per source pixel)
+                dst_row0[0] = c0; dst_row0[1] = c0;
+                dst_row0[2] = c1; dst_row0[3] = c1;
+                dst_row0[4] = c2; dst_row0[5] = c2;
+                dst_row0[6] = c3; dst_row0[7] = c3;
+                
+                // Write to row 1 (duplicate of row 0)
+                dst_row1[0] = c0; dst_row1[1] = c0;
+                dst_row1[2] = c1; dst_row1[3] = c1;
+                dst_row1[4] = c2; dst_row1[5] = c2;
+                dst_row1[6] = c3; dst_row1[7] = c3;
+                
+                dst_row0 += 8;
+                dst_row1 += 8;
+            }
+            
+            // Handle remaining pixels (if width not divisible by 4)
+            for (; x < MAC_SCREEN_WIDTH; x++) {
+                uint16 c = local_palette[pixel_row[x]];
+                dst_row0[0] = c; dst_row0[1] = c;
+                dst_row1[0] = c; dst_row1[1] = c;
+                dst_row0 += 2;
+                dst_row1 += 2;
+            }
+            
+            // Move output pointer by 2 display rows (2x vertical scaling)
+            out += DISPLAY_WIDTH * 2;
         }
         
-        // Calculate destination row pointers for the two scaled rows
-        uint16 *dst_row0 = dsi_framebuffer + (y * 2) * DISPLAY_WIDTH;
-        uint16 *dst_row1 = dst_row0 + DISPLAY_WIDTH;
+        // Push this chunk immediately to display
+        // 4 display rows * 1280 pixels = 5120 pixels per chunk
+        int display_y = mac_y * PIXEL_SCALE;
+        M5.Display.setAddrWindow(0, display_y, DISPLAY_WIDTH, STREAMING_ROW_COUNT);
+        M5.Display.writePixels(streaming_row_buffer, DISPLAY_WIDTH * STREAMING_ROW_COUNT);
         
-        // Process 4 decoded pixels at a time for better memory bandwidth
-        int x = 0;
-        for (; x < MAC_SCREEN_WIDTH - 3; x += 4) {
-            // Read 4 decoded pixels at once (32-bit read from 8-bit indices)
-            uint32 src4 = *((uint32 *)(pixel_row + x));
-            
-            // Convert each pixel through palette and write 2x2 scaled
-            uint16 c0 = local_palette[src4 & 0xFF];
-            uint16 c1 = local_palette[(src4 >> 8) & 0xFF];
-            uint16 c2 = local_palette[(src4 >> 16) & 0xFF];
-            uint16 c3 = local_palette[(src4 >> 24) & 0xFF];
-            
-            // Write to row 0 (2 pixels per source pixel)
-            dst_row0[0] = c0; dst_row0[1] = c0;
-            dst_row0[2] = c1; dst_row0[3] = c1;
-            dst_row0[4] = c2; dst_row0[5] = c2;
-            dst_row0[6] = c3; dst_row0[7] = c3;
-            
-            // Write to row 1 (duplicate of row 0)
-            dst_row1[0] = c0; dst_row1[1] = c0;
-            dst_row1[2] = c1; dst_row1[3] = c1;
-            dst_row1[4] = c2; dst_row1[5] = c2;
-            dst_row1[6] = c3; dst_row1[7] = c3;
-            
-            dst_row0 += 8;
-            dst_row1 += 8;
-        }
-        
-        // Handle remaining pixels (if width not divisible by 4)
-        for (; x < MAC_SCREEN_WIDTH; x++) {
-            uint16 c = local_palette[pixel_row[x]];
-            dst_row0[0] = c; dst_row0[1] = c;
-            dst_row1[0] = c; dst_row1[1] = c;
-            dst_row0 += 2;
-            dst_row1 += 2;
+        // Yield every 32 Mac rows (16 iterations) to let IDLE task run
+        // This prevents watchdog timeout during full-frame renders
+        if ((mac_y & 0x1F) == 0) {
+            taskYIELD();
         }
     }
     
-    // Flush CPU cache so DMA sees our writes
-    flushCacheForDMA(dsi_framebuffer, dsi_framebuffer_size);
-}
-
-/*
- *  Video rendering task - runs on Core 0
- *  Handles frame buffer conversion and display updates independently from CPU emulation
- */
-static void videoRenderTask(void *param)
-{
-    UNUSED(param);
-    Serial.println("[VIDEO] Video render task started on Core 0");
-    
-    // Unsubscribe this task from the watchdog timer
-    // The video rendering can take variable time and shouldn't trigger WDT
-    esp_task_wdt_delete(NULL);
-    
-    // Wait a moment for everything to initialize
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    while (video_task_running) {
-        // Check if a new frame is ready
-        if (frame_ready) {
-            frame_ready = false;
-            
-            // Render Mac framebuffer directly to DSI hardware buffer with 2x2 scaling
-            renderFrameToDSI(mac_frame_buffer);
-        }
-        
-        // Delay to allow other tasks to run and maintain ~60 FPS target
-        vTaskDelay(pdMS_TO_TICKS(16));
-    }
-    
-    Serial.println("[VIDEO] Video render task exiting");
-    vTaskDelete(NULL);
-}
-
-/*
- *  Start the video rendering task on Core 0
- */
-static bool startVideoTask(void)
-{
-    video_task_running = true;
-    
-    // Create video task pinned to Core 0
-    BaseType_t result = xTaskCreatePinnedToCore(
-        videoRenderTask,
-        "VideoTask",
-        VIDEO_TASK_STACK_SIZE,
-        NULL,
-        VIDEO_TASK_PRIORITY,
-        &video_task_handle,
-        VIDEO_TASK_CORE
-    );
-    
-    if (result != pdPASS) {
-        Serial.println("[VIDEO] ERROR: Failed to create video task!");
-        video_task_running = false;
-        return false;
-    }
-    
-    Serial.printf("[VIDEO] Video task created on Core %d\n", VIDEO_TASK_CORE);
-    return true;
+    M5.Display.endWrite();
 }
 
 /*
@@ -1256,75 +938,6 @@ static void stopVideoTask(void)
 }
 
 /*
- *  Get DSI framebuffer from M5GFX panel
- *  Returns pointer to the hardware DMA buffer that is continuously sent to the display
- */
-static uint16* getDSIFramebuffer(void)
-{
-    // Get the panel from M5.Display
-    auto panel = M5.Display.getPanel();
-    if (!panel) {
-        Serial.println("[VIDEO] ERROR: Could not get display panel!");
-        return NULL;
-    }
-    
-    // For DSI panels on ESP32-P4, we can use the startWrite/setWindow/writePixels approach
-    // But for best performance, we access the framebuffer directly
-    
-    // The panel's internal framebuffer can be accessed via writeImage with the right setup
-    // For now, we'll use a simpler approach: allocate our own buffer and use pushImage
-    
-    // Actually, let's try to get the internal framebuffer through the panel's config
-    // This requires casting to the specific panel type, but M5GFX abstracts this
-    
-    // Alternative approach: Use M5.Display.getBuffer() or similar
-    // M5Canvas has getBuffer() but M5.Display may not expose the DSI buffer directly
-    
-    // For DSI displays, the buffer is managed by the ESP-IDF LCD driver
-    // We can't easily access it through M5GFX without modifications
-    
-    // FALLBACK: Allocate a buffer and use pushImage to update the display
-    // This is still faster than the Canvas approach because:
-    // 1. We skip the rotation/zoom math
-    // 2. We can use pushImageDMA for asynchronous transfer
-    
-    Serial.println("[VIDEO] Using direct framebuffer approach...");
-    
-    // For the Tab5's MIPI-DSI display, we can try getting the framebuffer
-    // through the panel configuration
-    
-    // The simplest reliable method is to use M5.Display.setAddrWindow + writePixels
-    // But for true direct access, we need to allocate and manage our own buffer
-    
-    // Allocate our RGB565 framebuffer in PSRAM
-    uint32 fb_size = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16);
-    uint16 *fb = (uint16 *)ps_malloc(fb_size);
-    
-    if (fb) {
-        Serial.printf("[VIDEO] Allocated display framebuffer: %p (%d bytes)\n", fb, fb_size);
-        dsi_framebuffer_size = fb_size;
-    }
-    
-    return fb;
-}
-
-/*
- *  Push our framebuffer to the display using M5GFX
- *  Called after rendering is complete
- */
-static void pushFramebufferToDisplay(void)
-{
-    if (!dsi_framebuffer) return;
-    
-    // Use M5.Display.pushImage for efficient transfer
-    // This uses DMA internally on ESP32-P4
-    M5.Display.startWrite();
-    M5.Display.setAddrWindow(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-    M5.Display.writePixels((uint16_t*)dsi_framebuffer, DISPLAY_WIDTH * DISPLAY_HEIGHT);
-    M5.Display.endWrite();
-}
-
-/*
  *  Report video performance stats periodically
  */
 static void reportVideoPerfStats(void)
@@ -1337,18 +950,14 @@ static void reportVideoPerfStats(void)
         if (total_frames > 0) {
             Serial.printf("[VIDEO PERF] frames=%u (full=%u partial=%u skip=%u)\n",
                           total_frames, perf_full_count, perf_partial_count, perf_skip_count);
-            Serial.printf("[VIDEO PERF] avg: snapshot=%uus detect=%uus render=%uus push=%uus\n",
-                          perf_snapshot_us / (total_frames > 0 ? total_frames : 1),
+            Serial.printf("[VIDEO PERF] avg: detect=%uus render=%uus\n",
                           perf_detect_us / (total_frames > 0 ? total_frames : 1),
-                          perf_render_us / (total_frames > 0 ? total_frames : 1),
-                          perf_push_us / (total_frames > 0 ? total_frames : 1));
+                          perf_render_us / (total_frames > 0 ? total_frames : 1));
         }
         
         // Reset counters for next interval
-        perf_snapshot_us = 0;
         perf_detect_us = 0;
         perf_render_us = 0;
-        perf_push_us = 0;
         perf_frame_count = 0;
         perf_partial_count = 0;
         perf_full_count = 0;
@@ -1423,7 +1032,7 @@ static void videoRenderTaskOptimized(void *param)
         // Check if we need a full update (first frame, palette change, etc.)
         bool do_full_update = force_full_update;
         
-        if (!do_full_update && use_write_dirty_tracking) {
+        if (!do_full_update) {
             // WRITE-TIME DIRTY TRACKING: Collect dirty tiles marked by CPU writes
             // This is MUCH faster than frame comparison - just atomically reads and clears
             // the dirty bitmap that was populated by frame_direct_*_put calls
@@ -1440,44 +1049,22 @@ static void videoRenderTaskOptimized(void *param)
                 D(bug("[VIDEO] %d/%d tiles dirty (>%d%%), doing full update\n", 
                       dirty_tile_count, TOTAL_TILES, DIRTY_THRESHOLD_PERCENT));
             }
-        } else if (!do_full_update) {
-            // Fallback: use frame comparison (legacy path)
-            t0 = micros();
-            takeFrameSnapshot();
-            t1 = micros();
-            perf_snapshot_us += (t1 - t0);
-            
-            t0 = micros();
-            dirty_tile_count = detectDirtyTiles(snapshot_buffer, compare_buffer);
-            t1 = micros();
-            perf_detect_us += (t1 - t0);
-            
-            int dirty_threshold = (TOTAL_TILES * DIRTY_THRESHOLD_PERCENT) / 100;
-            if (dirty_tile_count > dirty_threshold) {
-                do_full_update = true;
-            }
-            
-            swapBuffers();
         }
         
         // RENDER - read directly from mac_frame_buffer (no snapshot needed with write-dirty)
         if (do_full_update) {
-            // Full update: render entire frame and push everything
+            // Full update: stream-render entire frame directly to display
+            // Uses internal SRAM row buffer, no PSRAM intermediate buffer needed
             t0 = micros();
-            renderFrameToDSI(mac_frame_buffer);
+            renderFrameStreaming(mac_frame_buffer, local_palette);
             t1 = micros();
             perf_render_us += (t1 - t0);
-            
-            t0 = micros();
-            pushFramebufferToDisplay();
-            t1 = micros();
-            perf_push_us += (t1 - t0);
             
             // Clear force_full_update flag
             force_full_update = false;
             perf_full_count++;
             
-            D(bug("[VIDEO] Full update complete\n"));
+            D(bug("[VIDEO] Full update complete (streaming)\n"));
         } else if (dirty_tile_count > 0) {
             // Partial update: render and push only dirty tiles
             // Read directly from mac_frame_buffer
@@ -1538,49 +1125,23 @@ bool VideoInit(bool classic)
     // Clear frame buffer to gray
     memset(mac_frame_buffer, 0x80, frame_buffer_size);
     
-    // Allocate triple buffering for race-free dirty tracking (in PSRAM)
-    // snapshot_buffer: atomic copy of mac_frame_buffer at start of each video frame
-    // compare_buffer: what we rendered last frame (for dirty detection)
-    snapshot_buffer = (uint8 *)ps_malloc(frame_buffer_size);
-    compare_buffer = (uint8 *)ps_malloc(frame_buffer_size);
-    
-    if (!snapshot_buffer || !compare_buffer) {
-        Serial.println("[VIDEO] ERROR: Failed to allocate triple buffers in PSRAM!");
-        if (snapshot_buffer) { free(snapshot_buffer); snapshot_buffer = NULL; }
-        if (compare_buffer) { free(compare_buffer); compare_buffer = NULL; }
-        free(mac_frame_buffer);
-        mac_frame_buffer = NULL;
-        return false;
-    }
-    
-    // Initialize buffers to match current (so first compare works correctly)
-    memset(snapshot_buffer, 0x80, frame_buffer_size);
-    memset(compare_buffer, 0x80, frame_buffer_size);
-    
     // Initialize dirty tracking
     memset(dirty_tiles, 0, sizeof(dirty_tiles));
+    memset(write_dirty_tiles, 0, sizeof(write_dirty_tiles));
     force_full_update = true;  // Force full update on first frame
     
-    Serial.printf("[VIDEO] Triple buffers allocated: snapshot=%p, compare=%p (%d bytes each)\n", 
-                  snapshot_buffer, compare_buffer, frame_buffer_size);
-    
-    // Get or allocate DSI framebuffer
-    dsi_framebuffer = getDSIFramebuffer();
-    if (!dsi_framebuffer) {
-        Serial.println("[VIDEO] ERROR: Failed to get DSI framebuffer!");
-        free(mac_frame_buffer);
-        mac_frame_buffer = NULL;
-        return false;
-    }
-    
-    // Clear DSI framebuffer to dark gray
+    // Clear display to dark gray using streaming row buffer
     uint16 gray565 = rgb888_to_rgb565(64, 64, 64);
-    for (uint32 i = 0; i < DISPLAY_WIDTH * DISPLAY_HEIGHT; i++) {
-        dsi_framebuffer[i] = gray565;
+    for (int i = 0; i < DISPLAY_WIDTH * STREAMING_ROW_COUNT; i++) {
+        streaming_row_buffer[i] = gray565;
     }
-    
-    // Push initial screen
-    pushFramebufferToDisplay();
+    M5.Display.startWrite();
+    for (int y = 0; y < DISPLAY_HEIGHT; y += STREAMING_ROW_COUNT) {
+        M5.Display.setAddrWindow(0, y, DISPLAY_WIDTH, STREAMING_ROW_COUNT);
+        M5.Display.writePixels(streaming_row_buffer, DISPLAY_WIDTH * STREAMING_ROW_COUNT);
+    }
+    M5.Display.endWrite();
+    Serial.println("[VIDEO] Initial screen cleared");
     
     // Set up Mac frame buffer pointers
     MacFrameBaseHost = mac_frame_buffer;
@@ -1681,21 +1242,6 @@ void VideoExit(void)
     if (mac_frame_buffer) {
         free(mac_frame_buffer);
         mac_frame_buffer = NULL;
-    }
-    
-    if (snapshot_buffer) {
-        free(snapshot_buffer);
-        snapshot_buffer = NULL;
-    }
-    
-    if (compare_buffer) {
-        free(compare_buffer);
-        compare_buffer = NULL;
-    }
-    
-    if (dsi_framebuffer) {
-        free(dsi_framebuffer);
-        dsi_framebuffer = NULL;
     }
     
     // Clear monitors vector

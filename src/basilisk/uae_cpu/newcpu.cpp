@@ -29,7 +29,7 @@
 // ESP32 PSRAM support for large data structures and IRAM placement
 #ifdef ARDUINO
 #include <esp_heap_caps.h>
-#include <esp_attr.h>  // For IRAM_ATTR
+#include <esp_attr.h>  // For IRAM_ATTR, DRAM_ATTR
 #endif
 
 #include "cpu_emulation.h"
@@ -369,11 +369,7 @@ void exit_m68k (void)
 
 // Place CPU registers in internal SRAM for fast access (accessed every instruction)
 // ESP32-P4 internal DRAM is ~10x faster than PSRAM
-#ifdef ARDUINO
-__attribute__((section(".dram0.data"))) struct regstruct regs;
-#else
-struct regstruct regs;
-#endif
+DRAM_ATTR struct regstruct regs;
 struct regstruct *lastint_regs_ptr = NULL;
 #define lastint_regs (*lastint_regs_ptr)
 // regs_backup removed - was 1856 bytes and never used
