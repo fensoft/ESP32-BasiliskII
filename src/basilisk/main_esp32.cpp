@@ -477,6 +477,10 @@ void basilisk_loop(void)
         VideoRefresh();  // Now just signals the video task, doesn't render
     }
     
+    // Periodic disk cache flush (every 2 seconds)
+    // This ensures dirty sectors are written to SD card without blocking writes
+    Sys_periodic_flush();
+    
     // Poll for input events (touch panel, USB keyboard/mouse)
     // This updates M5.Touch state and forwards events to ADB
     M5.update();

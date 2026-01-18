@@ -73,4 +73,7 @@ extern bool SysCDScan(void *fh, uint8 start_m, uint8 start_s, uint8 start_f, boo
 extern void SysCDSetVolume(void *fh, uint8 left, uint8 right);
 extern void SysCDGetVolume(void *fh, uint8 &left, uint8 &right);
 
+// Periodic flush for sector cache - call from main loop
+extern void Sys_periodic_flush(void);
+
 #endif
