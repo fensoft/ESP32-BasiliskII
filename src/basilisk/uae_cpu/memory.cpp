@@ -352,6 +352,9 @@ static uintptr FrameBaseDiff;	// MacFrameBaseHost - MacFrameBaseMac
 
 uae_u32 REGPARAM2 frame_direct_lget(uaecptr addr)
 {
+    // Track read-back from video RAM for debugging
+    VideoTrackReadBack(addr - MacFrameBaseMac, 4);
+    
     uae_u32 *m;
     m = (uae_u32 *)(FrameBaseDiff + addr);
     return do_get_mem_long(m);
@@ -359,6 +362,9 @@ uae_u32 REGPARAM2 frame_direct_lget(uaecptr addr)
 
 uae_u32 REGPARAM2 frame_direct_wget(uaecptr addr)
 {
+    // Track read-back from video RAM for debugging
+    VideoTrackReadBack(addr - MacFrameBaseMac, 2);
+    
     uae_u16 *m;
     m = (uae_u16 *)(FrameBaseDiff + addr);
     return do_get_mem_word(m);
@@ -366,6 +372,9 @@ uae_u32 REGPARAM2 frame_direct_wget(uaecptr addr)
 
 uae_u32 REGPARAM2 frame_direct_bget(uaecptr addr)
 {
+    // Track read-back from video RAM for debugging
+    VideoTrackReadBack(addr - MacFrameBaseMac, 1);
+    
     return (uae_u32)*(uae_u8 *)(FrameBaseDiff + addr);
 }
 
@@ -374,8 +383,19 @@ void REGPARAM2 frame_direct_lput(uaecptr addr, uae_u32 l)
     uae_u32 *m;
     m = (uae_u32 *)(FrameBaseDiff + addr);
     do_put_mem_long(m, l);
-    // Mark dirty tiles for write-time tracking (offset from frame buffer base)
-    VideoMarkDirtyRange(addr - MacFrameBaseMac, 4);
+    
+    uint32_t offset = addr - MacFrameBaseMac;
+    
+    // Queue the write with pixel data (big-endian byte order as stored in Mac memory)
+    uint8_t data[4];
+    data[0] = (l >> 24) & 0xFF;
+    data[1] = (l >> 16) & 0xFF;
+    data[2] = (l >> 8) & 0xFF;
+    data[3] = l & 0xFF;
+    VideoQueueWrite(offset, data, 4);
+    
+    // Mark dirty tiles for write-time tracking
+    VideoMarkDirtyRange(offset, 4);
 }
 
 void REGPARAM2 frame_direct_wput(uaecptr addr, uae_u32 w)
@@ -383,15 +403,32 @@ void REGPARAM2 frame_direct_wput(uaecptr addr, uae_u32 w)
     uae_u16 *m;
     m = (uae_u16 *)(FrameBaseDiff + addr);
     do_put_mem_word(m, w);
+    
+    uint32_t offset = addr - MacFrameBaseMac;
+    
+    // Queue the write with pixel data (big-endian byte order)
+    uint8_t data[2];
+    data[0] = (w >> 8) & 0xFF;
+    data[1] = w & 0xFF;
+    VideoQueueWrite(offset, data, 2);
+    
     // Mark dirty tiles for write-time tracking
-    VideoMarkDirtyRange(addr - MacFrameBaseMac, 2);
+    VideoMarkDirtyRange(offset, 2);
 }
 
 void REGPARAM2 frame_direct_bput(uaecptr addr, uae_u32 b)
 {
     *(uae_u8 *)(FrameBaseDiff + addr) = b;
+    
+    uint32_t offset = addr - MacFrameBaseMac;
+    
+    // Queue the write with pixel data
+    uint8_t data[1];
+    data[0] = b & 0xFF;
+    VideoQueueWrite(offset, data, 1);
+    
     // Mark dirty tile for write-time tracking
-    VideoMarkDirtyOffset(addr - MacFrameBaseMac);
+    VideoMarkDirtyOffset(offset);
 }
 
 uae_u32 REGPARAM2 frame_host_555_lget(uaecptr addr)

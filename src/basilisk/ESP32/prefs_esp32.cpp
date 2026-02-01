@@ -24,7 +24,7 @@ void AddPlatformPrefsDefaults(void)
     PrefsAddInt32("modelid", 5);  // Mac SE (Gestalt ID)
     PrefsAddInt32("cpu", 0);  // 68000
     PrefsAddBool("fpu", false);  // No FPU
-    PrefsAddBool("nosound", true);  // Disable sound
+    PrefsAddBool("nosound", false);  // Enable sound via ES8388 codec
     PrefsAddBool("nogui", true);  // No GUI
     
     // Screen: 512x342, 1-bit B&W (Mac SE/Classic native)

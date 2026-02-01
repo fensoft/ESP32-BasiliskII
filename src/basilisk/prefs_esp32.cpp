@@ -60,8 +60,8 @@ void LoadPrefs(const char *vmdir)
         Serial.println("[PREFS] Disk: /Macintosh8.dsk (default, read-write)");
     }
     
-    // Disable sound (for now)
-    PrefsReplaceBool("nosound", true);
+    // Enable sound output via ES8388 codec
+    PrefsReplaceBool("nosound", false);
     
     // Get CD-ROM path from Boot GUI selection
     const char* cdrom_path = BootGUI_GetCDROMPath();

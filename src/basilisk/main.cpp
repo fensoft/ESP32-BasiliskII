@@ -38,9 +38,13 @@
 #include "user_strings.h"
 #include "prefs.h"
 #include "main.h"
+#include "boot_gui.h"
 
 #define DEBUG 0
 #include "debug.h"
+
+// Track if audio was initialized (for conditional exit)
+static bool audio_was_initialized = false;
 
 #if ENABLE_MON
 #include "mon.h"
@@ -166,8 +170,11 @@ bool InitAll(const char *vmdir)
 	// Init ADB
 	ADBInit();
 
-	// Init audio
-	AudioInit();
+	// Init audio (only if enabled in boot GUI settings)
+	if (BootGUI_GetAudioEnabled()) {
+		AudioInit();
+		audio_was_initialized = true;
+	}
 
 	// Init video
 	if (!VideoInit(ROMVersion == ROM_VERSION_64K || ROMVersion == ROM_VERSION_PLUS || ROMVersion == ROM_VERSION_CLASSIC))
@@ -222,8 +229,10 @@ void ExitAll(void)
 	// Exit video
 	VideoExit();
 
-	// Exit audio
-	AudioExit();
+	// Exit audio (only if it was initialized)
+	if (audio_was_initialized) {
+		AudioExit();
+	}
 
 	// Exit ADB
 	ADBExit();

@@ -13,8 +13,8 @@
 #include "macos_util.h"
 #include "scsi.h"
 #include "serial.h"
-#include "audio.h"
 // Note: ether.h not needed - real ethernet implementation in ether.cpp/ether_esp32.cpp
+// Note: audio.h not needed - real audio implementation in audio.cpp/audio_esp32.cpp
 #include "user_strings.h"
 
 /*
@@ -78,46 +78,9 @@ void SerialInterrupt(void) {}
  */
 
 /*
- * Audio driver stubs
+ * Audio driver - real implementation in audio.cpp and audio_esp32.cpp
+ * (stubs removed to avoid duplicate symbols)
  */
-
-#include <vector>
-
-uint32 audio_component_flags = 0;
-bool audio_open = false;
-std::vector<uint32> audio_sample_rates;
-std::vector<uint16> audio_sample_sizes;
-std::vector<uint8> audio_channel_counts;
-
-// Audio status structure - defined in audio.h as struct audio_status
-struct audio_status AudioStatus = { 0, 0, 0, 0, 0 };
-
-void AudioInit(void) {
-    audio_open = false;
-    audio_sample_rates.clear();
-    audio_sample_rates.push_back(22050 << 16);  // 16.16 fixed point
-    audio_sample_rates.push_back(44100 << 16);
-    audio_sample_sizes.clear();
-    audio_sample_sizes.push_back(8);
-    audio_sample_sizes.push_back(16);
-    audio_channel_counts.clear();
-    audio_channel_counts.push_back(1);
-    audio_channel_counts.push_back(2);
-    AudioStatus.sample_rate = 44100 << 16;
-    AudioStatus.sample_size = 16;
-    AudioStatus.channels = 2;
-    AudioStatus.mixer = 0;
-    AudioStatus.num_sources = 0;
-}
-void AudioExit(void) { audio_open = false; }
-void AudioReset(void) { audio_open = false; }
-void AudioInterrupt(void) {}
-int32 AudioDispatch(uint32 params, uint32 ti) { (void)params; (void)ti; return noErr; }
-int16 SoundInOpen(uint32 pb, uint32 dce) { (void)pb; (void)dce; return noErr; }
-int16 SoundInPrime(uint32 pb, uint32 dce) { (void)pb; (void)dce; return noErr; }
-int16 SoundInControl(uint32 pb, uint32 dce) { (void)pb; (void)dce; return noErr; }
-int16 SoundInStatus(uint32 pb, uint32 dce) { (void)pb; (void)dce; return noErr; }
-int16 SoundInClose(uint32 pb, uint32 dce) { (void)pb; (void)dce; return noErr; }
 
 /*
  * Timer functions - ESP32 implementation

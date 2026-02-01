@@ -92,6 +92,21 @@
 #define VIDEO_TASK_PRIORITY    1
 #define VIDEO_TASK_CORE        0  // Run on Core 0, leaving Core 1 for CPU emulation
 
+// ============================================================================
+// Write-Through Queue Configuration
+// ============================================================================
+// When enabled, pixel data is captured at write time and pushed directly to
+// display from the queue, eliminating PSRAM read-back for video rendering.
+// This halves PSRAM video traffic (write-only, no reads for display).
+// Set to 0 to use the original PSRAM read-back rendering method.
+#define VIDEO_USE_WRITE_THROUGH_QUEUE 0  // Disabled - queue overflow makes it slower than PSRAM read-back
+
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
+// Queue size: number of write entries (8 bytes each)
+// ~8KB internal SRAM = 1024 entries, should handle typical frame updates
+#define WRITE_QUEUE_SIZE 1024
+#endif
+
 // Frame buffer for Mac emulation (CPU writes here)
 static uint8 *mac_frame_buffer = NULL;
 static uint32 frame_buffer_size = 0;
@@ -123,6 +138,142 @@ DRAM_ATTR static uint32 write_dirty_tiles[(TOTAL_TILES + 31) / 32];    // Tiles 
 // This prevents torn data from race conditions during snapshot
 DRAM_ATTR static uint32 tile_render_active[(TOTAL_TILES + 31) / 32];   // Tiles currently being rendered
 
+// ============================================================================
+// Write-Through Queue Data Structures
+// ============================================================================
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
+
+// Queue entry structure - 8 bytes each, aligned for efficient access
+// Stores pixel data at write time to avoid PSRAM read-back during rendering
+struct WriteQueueEntry {
+    uint32_t offset;      // Byte offset into frame buffer (0 to frame_buffer_size-1)
+    uint8_t data[4];      // Pixel data (1-4 bytes depending on write size)
+    uint8_t size;         // Number of valid bytes in data[] (1, 2, or 4)
+    uint8_t padding[3];   // Padding to align to 8 bytes
+};
+
+// Circular queue in internal SRAM for fast access from both CPU and video task
+// Size: WRITE_QUEUE_SIZE * 8 bytes = 8KB for 1024 entries
+DRAM_ATTR static WriteQueueEntry write_queue[WRITE_QUEUE_SIZE];
+DRAM_ATTR static volatile uint32_t queue_head = 0;  // Write position (CPU writes here)
+DRAM_ATTR static volatile uint32_t queue_tail = 0;  // Read position (video task reads from here)
+
+// Per-tile PSRAM fallback flags - if queue overflows, we fall back to reading
+// from PSRAM for affected tiles (graceful degradation)
+DRAM_ATTR static uint32_t tile_needs_psram_read[(TOTAL_TILES + 31) / 32];
+
+// ============================================================================
+// Tile Content Cache - maintains shadow copies of recently-dirty tiles
+// This allows rendering without reading from PSRAM
+// ============================================================================
+
+// Number of tiles we can cache in internal SRAM
+// 8 tiles * 1600 bytes = 12.8KB, reasonable for internal SRAM
+#define TILE_CACHE_SIZE 8
+
+// Tile cache entry - holds shadow copy of tile content
+struct TileCacheEntry {
+    int16_t tile_idx;     // Which tile this is (-1 if unused)
+    uint16_t access_count; // LRU counter (higher = more recently used)
+    uint8_t content[TILE_WIDTH * TILE_HEIGHT];  // 1600 bytes of pixel data (8-bit indices)
+};
+
+// Tile cache in internal SRAM
+DRAM_ATTR static TileCacheEntry tile_cache[TILE_CACHE_SIZE];
+
+// LRU counter - incremented on each cache access
+static uint16_t cache_lru_counter = 0;
+
+// Mapping from tile_idx to cache slot (-1 if not cached)
+// This allows O(1) lookup of whether a tile is in cache
+DRAM_ATTR static int8_t tile_to_cache_slot[TOTAL_TILES];
+
+// Debug/profiling statistics for write-through queue
+static uint32_t dbg_queue_writes = 0;          // Total writes queued
+static uint32_t dbg_queue_max_depth = 0;       // Peak queue depth seen
+static uint32_t dbg_queue_overflows = 0;       // Times queue was full (overflow)
+static uint32_t dbg_psram_fallbacks = 0;       // Tiles that fell back to PSRAM read
+static uint32_t dbg_readback_count = 0;        // Mac software read-back attempts
+static uint32_t dbg_queue_entries_processed = 0;  // Queue entries processed per frame
+static uint32_t dbg_cache_hits = 0;            // Tile was found in cache
+static uint32_t dbg_cache_misses = 0;          // Tile needed to be loaded into cache
+static uint32_t dbg_cache_evictions = 0;       // Tiles evicted from cache
+
+// Spinlock for queue operations (needed for cross-core synchronization)
+static portMUX_TYPE queue_spinlock = portMUX_INITIALIZER_UNLOCKED;
+
+// Forward declaration
+static void snapshotTile(uint8 *src_buffer, int tile_x, int tile_y, uint8 *snapshot);
+
+// Initialize tile cache at startup
+static void initTileCache(void)
+{
+    for (int i = 0; i < TILE_CACHE_SIZE; i++) {
+        tile_cache[i].tile_idx = -1;
+        tile_cache[i].access_count = 0;
+    }
+    for (int i = 0; i < TOTAL_TILES; i++) {
+        tile_to_cache_slot[i] = -1;
+    }
+    cache_lru_counter = 0;
+}
+
+// Find a cache slot for a tile (allocate if needed, evict LRU if full)
+// Returns slot index, or -1 if allocation failed
+static int allocateCacheSlot(int tile_idx)
+{
+    // Check if tile is already cached
+    int8_t existing_slot = tile_to_cache_slot[tile_idx];
+    if (existing_slot >= 0) {
+        // Update LRU
+        tile_cache[existing_slot].access_count = ++cache_lru_counter;
+        dbg_cache_hits++;
+        return existing_slot;
+    }
+    
+    // Find an empty slot or LRU slot to evict
+    int best_slot = 0;
+    uint16_t oldest_access = tile_cache[0].access_count;
+    
+    for (int i = 0; i < TILE_CACHE_SIZE; i++) {
+        if (tile_cache[i].tile_idx < 0) {
+            // Empty slot - use it
+            best_slot = i;
+            break;
+        }
+        if (tile_cache[i].access_count < oldest_access) {
+            oldest_access = tile_cache[i].access_count;
+            best_slot = i;
+        }
+    }
+    
+    // Evict if slot was in use
+    if (tile_cache[best_slot].tile_idx >= 0) {
+        int evicted_tile = tile_cache[best_slot].tile_idx;
+        tile_to_cache_slot[evicted_tile] = -1;
+        dbg_cache_evictions++;
+    }
+    
+    // Assign slot to new tile
+    tile_cache[best_slot].tile_idx = tile_idx;
+    tile_cache[best_slot].access_count = ++cache_lru_counter;
+    tile_to_cache_slot[tile_idx] = best_slot;
+    
+    dbg_cache_misses++;
+    return best_slot;
+}
+
+// Get cache slot for a tile, or -1 if not cached
+static inline int getCacheSlot(int tile_idx)
+{
+    return tile_to_cache_slot[tile_idx];
+}
+
+// Forward declaration - implemented after variable declarations
+static void applyCacheWrite(uint32_t offset, const uint8_t* data, uint32_t size);
+
+#endif // VIDEO_USE_WRITE_THROUGH_QUEUE
+
 // Double-buffered row buffers for streaming full-frame renders with async DMA
 // Processes 4 Mac rows at a time (becomes 8 display rows with 2x scaling)
 // Size: 1280 pixels * 8 rows * 2 bytes = 20,480 bytes (20KB) per buffer
@@ -151,6 +302,62 @@ static volatile uint32 current_bytes_per_row = MAC_SCREEN_WIDTH;  // Bytes per r
 static volatile int current_pixels_per_byte = 1;  // Pixels packed per byte (8=1bit, 4=2bit, 2=4bit, 1=8bit)
 static volatile int current_bit_shift = 0;  // Bits to shift per pixel (7=1bit, 6=2bit, 4=4bit, 0=8bit)
 static volatile uint8 current_pixel_mask = 0xFF;  // Mask for extracting pixel value
+
+// ============================================================================
+// Write-Through Queue - applyCacheWrite implementation
+// (Defined here because it needs current_* variables declared above)
+// ============================================================================
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
+
+/*
+ *  Apply a write to the tile cache
+ *  Called from VideoQueueWrite path to update cached tile content directly
+ *  with the write data, avoiding later PSRAM reads.
+ *  
+ *  @param offset  Byte offset into the Mac framebuffer
+ *  @param data    Pointer to pixel data being written
+ *  @param size    Number of bytes (1, 2, or 4)
+ */
+static void applyCacheWrite(uint32_t offset, const uint8_t* data, uint32_t size)
+{
+    if (offset >= frame_buffer_size) return;
+    
+    uint32_t bpr = current_bytes_per_row;
+    video_depth depth = current_depth;
+    
+    // For 8-bit mode, we can update cache directly
+    // For packed modes, we need to decode the write
+    if (depth == VDEPTH_8BIT) {
+        // Simple case: each byte offset = one pixel
+        for (uint32_t i = 0; i < size; i++) {
+            uint32_t byte_offset = offset + i;
+            if (byte_offset >= frame_buffer_size) break;
+            
+            int y = byte_offset / bpr;
+            int x = byte_offset % bpr;
+            
+            if (y >= MAC_SCREEN_HEIGHT || x >= MAC_SCREEN_WIDTH) continue;
+            
+            int tile_x = x / TILE_WIDTH;
+            int tile_y = y / TILE_HEIGHT;
+            int tile_idx = tile_y * TILES_X + tile_x;
+            
+            int cache_slot = getCacheSlot(tile_idx);
+            if (cache_slot >= 0) {
+                // Calculate position within tile
+                int local_x = x % TILE_WIDTH;
+                int local_y = y % TILE_HEIGHT;
+                int local_offset = local_y * TILE_WIDTH + local_x;
+                
+                tile_cache[cache_slot].content[local_offset] = data[i];
+            }
+        }
+    }
+    // For packed modes (1/2/4-bit), we'd need more complex logic
+    // For now, packed mode writes will still work via the PSRAM fallback path
+}
+
+#endif // VIDEO_USE_WRITE_THROUGH_QUEUE
 
 // ============================================================================
 // Performance profiling counters (lightweight, always enabled)
@@ -638,6 +845,253 @@ void VideoMarkDirtyRange(uint32 offset, uint32 size)
     }
 }
 
+// ============================================================================
+// Write-Through Queue Functions
+// ============================================================================
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
+
+/*
+ *  Calculate which tile(s) an offset belongs to and mark for PSRAM fallback
+ *  Called when queue overflows to ensure correct rendering via fallback path
+ */
+static void markTileNeedsPsramRead(uint32_t offset)
+{
+    if (offset >= frame_buffer_size) return;
+    
+    uint32 bpr = current_bytes_per_row;
+    int ppb = current_pixels_per_byte;
+    
+    int y = offset / bpr;
+    if (y >= MAC_SCREEN_HEIGHT) return;
+    
+    int byte_in_row = offset % bpr;
+    int pixel_x = byte_in_row * ppb;
+    
+    if (pixel_x >= MAC_SCREEN_WIDTH) return;
+    
+    int tile_x = pixel_x / TILE_WIDTH;
+    int tile_y = y / TILE_HEIGHT;
+    int tile_idx = tile_y * TILES_X + tile_x;
+    
+    if (tile_idx < TOTAL_TILES) {
+        __atomic_or_fetch(&tile_needs_psram_read[tile_idx / 32], (1u << (tile_idx % 32)), __ATOMIC_RELAXED);
+    }
+}
+
+/*
+ *  Check if a tile needs PSRAM fallback (due to queue overflow)
+ */
+static inline bool tileNeedsPsramRead(int tile_idx)
+{
+    return (__atomic_load_n(&tile_needs_psram_read[tile_idx / 32], __ATOMIC_ACQUIRE) & (1u << (tile_idx % 32))) != 0;
+}
+
+/*
+ *  Clear PSRAM fallback flags for all tiles
+ *  Called at the start of each frame
+ */
+static void clearPsramFallbackFlags(void)
+{
+    for (int i = 0; i < (TOTAL_TILES + 31) / 32; i++) {
+        tile_needs_psram_read[i] = 0;
+    }
+}
+
+/*
+ *  Get current queue depth (for debugging)
+ */
+static inline uint32_t getQueueDepth(void)
+{
+    uint32_t head = queue_head;
+    uint32_t tail = queue_tail;
+    if (head >= tail) {
+        return head - tail;
+    } else {
+        return WRITE_QUEUE_SIZE - tail + head;
+    }
+}
+
+/*
+ *  Queue a pixel write for later processing by the video task
+ *  This captures the pixel data at write time, eliminating the need to read
+ *  from PSRAM during rendering.
+ *  
+ *  Also updates the tile cache directly if the affected tile is cached.
+ *  
+ *  Called from memory.cpp frame_direct_*put() functions on CPU core.
+ *  Must be thread-safe with respect to video task reading from queue.
+ *  
+ *  @param offset  Byte offset into the Mac framebuffer
+ *  @param data    Pointer to pixel data being written
+ *  @param size    Number of bytes (1, 2, or 4)
+ */
+void VideoQueueWrite(uint32_t offset, const uint8_t* data, uint32_t size)
+{
+    if (offset >= frame_buffer_size) return;
+    if (size == 0 || size > 4) return;
+    
+    // Use spinlock for thread safety between CPU core and video task
+    portENTER_CRITICAL(&queue_spinlock);
+    
+    uint32_t next_head = (queue_head + 1) % WRITE_QUEUE_SIZE;
+    
+    if (next_head == queue_tail) {
+        // Queue full - mark affected tile(s) for PSRAM fallback
+        portEXIT_CRITICAL(&queue_spinlock);
+        markTileNeedsPsramRead(offset);
+        dbg_queue_overflows++;
+        return;
+    }
+    
+    // Add entry to queue
+    write_queue[queue_head].offset = offset;
+    write_queue[queue_head].size = (uint8_t)size;
+    
+    // Copy pixel data (1-4 bytes)
+    for (uint32_t i = 0; i < size; i++) {
+        write_queue[queue_head].data[i] = data[i];
+    }
+    
+    // Update head position
+    queue_head = next_head;
+    
+    portEXIT_CRITICAL(&queue_spinlock);
+    
+    // Update tile cache with this write (outside spinlock for performance)
+    // This directly updates the cached tile content so we don't need PSRAM reads
+    applyCacheWrite(offset, data, size);
+    
+    // Update debug stats (outside critical section)
+    dbg_queue_writes++;
+    uint32_t depth = getQueueDepth();
+    if (depth > dbg_queue_max_depth) {
+        dbg_queue_max_depth = depth;
+    }
+}
+
+/*
+ *  Track read-back from video RAM (for debugging)
+ *  Called from memory.cpp frame_direct_*get() functions.
+ *  Helps identify if Mac software actually reads from video RAM.
+ *  
+ *  @param offset  Byte offset into the Mac framebuffer
+ *  @param size    Number of bytes being read
+ */
+void VideoTrackReadBack(uint32_t offset, uint32_t size)
+{
+    (void)offset;  // Currently unused, but could log specific addresses
+    (void)size;
+    dbg_readback_count++;
+}
+
+/*
+ *  Get the next entry from the write queue (for video task)
+ *  Returns true if an entry was available, false if queue is empty.
+ *  
+ *  @param entry   Output: the queue entry
+ *  @return        true if entry was retrieved, false if queue empty
+ */
+static bool dequeueWriteEntry(WriteQueueEntry* entry)
+{
+    portENTER_CRITICAL(&queue_spinlock);
+    
+    if (queue_tail == queue_head) {
+        // Queue empty
+        portEXIT_CRITICAL(&queue_spinlock);
+        return false;
+    }
+    
+    // Copy entry
+    *entry = write_queue[queue_tail];
+    
+    // Advance tail
+    queue_tail = (queue_tail + 1) % WRITE_QUEUE_SIZE;
+    
+    portEXIT_CRITICAL(&queue_spinlock);
+    
+    dbg_queue_entries_processed++;
+    return true;
+}
+
+/*
+ *  Build tile content from the tile cache or fall back to PSRAM
+ *  This is the core of the write-through approach: instead of reading from
+ *  PSRAM, we use the cached tile content that was updated at write time.
+ *  
+ *  For tiles that had queue overflow or aren't cached, falls back to PSRAM read.
+ *  
+ *  @param tile_x      Tile column index
+ *  @param tile_y      Tile row index  
+ *  @param snapshot    Output buffer (TILE_WIDTH * TILE_HEIGHT bytes)
+ *  @param src_buffer  PSRAM frame buffer (for fallback)
+ *  @return            true if used cache, false if fell back to PSRAM
+ */
+static bool buildTileFromCache(int tile_x, int tile_y, uint8* snapshot, uint8* src_buffer)
+{
+    int tile_idx = tile_y * TILES_X + tile_x;
+    
+    // Check if tile needs PSRAM fallback (queue overflow)
+    if (tileNeedsPsramRead(tile_idx)) {
+        snapshotTile(src_buffer, tile_x, tile_y, snapshot);
+        dbg_psram_fallbacks++;
+        return false;
+    }
+    
+    // Check if tile is in cache
+    int cache_slot = getCacheSlot(tile_idx);
+    if (cache_slot >= 0) {
+        // Copy from cache to snapshot
+        memcpy(snapshot, tile_cache[cache_slot].content, TILE_WIDTH * TILE_HEIGHT);
+        return true;
+    }
+    
+    // Tile not in cache - allocate a slot and load from PSRAM
+    // This happens the first time a tile is accessed, or if it was evicted
+    cache_slot = allocateCacheSlot(tile_idx);
+    if (cache_slot >= 0) {
+        // Load tile content from PSRAM into cache
+        snapshotTile(src_buffer, tile_x, tile_y, tile_cache[cache_slot].content);
+        // Copy to snapshot
+        memcpy(snapshot, tile_cache[cache_slot].content, TILE_WIDTH * TILE_HEIGHT);
+    } else {
+        // Allocation failed (shouldn't happen with LRU), fall back to PSRAM
+        snapshotTile(src_buffer, tile_x, tile_y, snapshot);
+        dbg_psram_fallbacks++;
+    }
+    
+    return false;  // Had to load from PSRAM
+}
+
+/*
+ *  Wrapper function for compatibility - builds tile using cache or PSRAM
+ */
+static void buildTileFromQueue(int tile_x, int tile_y, uint8* snapshot, uint8* src_buffer)
+{
+    buildTileFromCache(tile_x, tile_y, snapshot, src_buffer);
+}
+
+#else // !VIDEO_USE_WRITE_THROUGH_QUEUE
+
+// Stub implementations when write-through queue is disabled
+// These are called from memory.cpp but do nothing when queue is not used
+
+void VideoQueueWrite(uint32_t offset, const uint8_t* data, uint32_t size)
+{
+    (void)offset;
+    (void)data;
+    (void)size;
+    // No-op when write-through queue is disabled
+}
+
+void VideoTrackReadBack(uint32_t offset, uint32_t size)
+{
+    (void)offset;
+    (void)size;
+    // No-op when write-through queue is disabled
+}
+
+#endif // VIDEO_USE_WRITE_THROUGH_QUEUE
+
 /*
  *  Collect write-dirty tiles into the render dirty bitmap and clear write bitmap
  *  Returns the number of dirty tiles
@@ -849,7 +1303,13 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
             
             // STEP 2: Take a mini-snapshot of just this tile
             // While render_active is set, CPU writes will re-mark tile dirty
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
+            // Use tile cache if available - avoids PSRAM read
+            buildTileFromCache(tx, ty, current_snapshot, src_buffer);
+#else
+            // Original method: read directly from PSRAM
             snapshotTile(src_buffer, tx, ty, current_snapshot);
+#endif
             
             // STEP 3: Clear render lock - snapshot is complete
             // Any CPU writes after this point will be visible in next frame
@@ -1072,6 +1532,32 @@ static void reportVideoPerfStats(void)
                           perf_render_us / (total_frames > 0 ? total_frames : 1));
         }
         
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
+        // Report write-through queue statistics
+        uint32_t queue_depth = getQueueDepth();
+        Serial.printf("[VIDEO QUEUE] writes=%u maxdepth=%u overflows=%u fallbacks=%u\n",
+                      dbg_queue_writes, dbg_queue_max_depth, dbg_queue_overflows, dbg_psram_fallbacks);
+        Serial.printf("[VIDEO QUEUE] cache: hits=%u misses=%u evictions=%u depth=%u/%u\n",
+                      dbg_cache_hits, dbg_cache_misses, dbg_cache_evictions, queue_depth, WRITE_QUEUE_SIZE);
+        
+        // Report read-back count (should be very low for good performance)
+        if (dbg_readback_count > 0) {
+            Serial.printf("[VIDEO QUEUE] WARNING: readbacks=%u (Mac software reading video RAM)\n",
+                          dbg_readback_count);
+        }
+        
+        // Reset queue stats for next interval
+        dbg_queue_writes = 0;
+        dbg_queue_max_depth = 0;
+        dbg_queue_overflows = 0;
+        dbg_psram_fallbacks = 0;
+        dbg_cache_hits = 0;
+        dbg_cache_misses = 0;
+        dbg_cache_evictions = 0;
+        dbg_readback_count = 0;
+        dbg_queue_entries_processed = 0;
+#endif
+        
         // Reset counters for next interval
         perf_detect_us = 0;
         perf_render_us = 0;
@@ -1165,6 +1651,13 @@ static void videoRenderTaskOptimized(void *param)
         // Collect dirty tiles from write-time tracking
         t0 = micros();
         dirty_tile_count = collectWriteDirtyTiles();
+        
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
+        // Clear PSRAM fallback flags for this frame
+        // Tiles that overflowed the queue last frame will be marked again if needed
+        clearPsramFallbackFlags();
+#endif
+        
         t1 = micros();
         perf_detect_us += (t1 - t0);
         
@@ -1245,6 +1738,17 @@ bool VideoInit(bool classic)
     memset(write_dirty_tiles, 0, sizeof(write_dirty_tiles));
     memset(tile_render_active, 0, sizeof(tile_render_active));
     force_full_update = true;  // Force full update on first frame
+    
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
+    // Initialize write-through queue and tile cache
+    initTileCache();
+    memset(tile_needs_psram_read, 0, sizeof(tile_needs_psram_read));
+    queue_head = 0;
+    queue_tail = 0;
+    Serial.println("[VIDEO] Write-through queue ENABLED");
+#else
+    Serial.println("[VIDEO] Write-through queue DISABLED (using PSRAM read-back)");
+#endif
     
     // Clear display to dark gray using streaming row buffer
     uint16 gray565 = rgb888_to_rgb565(64, 64, 64);

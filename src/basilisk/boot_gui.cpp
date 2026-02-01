@@ -314,6 +314,9 @@ static char wifi_password[64] = "";
 static bool wifi_auto_connect = false;
 static bool wifi_initialized = false;
 
+// Audio settings
+static bool audio_enabled = false;  // Default: audio disabled (buggy)
+
 static const char* SETTINGS_FILE = "/basilisk_settings.txt";
 
 // ============================================================================
@@ -416,6 +419,9 @@ static void loadSettings(void)
         } else if (key == "wifi_auto") {
             wifi_auto_connect = (value == "yes" || value == "true" || value == "1");
             Serial.printf("[BOOT_GUI] Loaded wifi_auto: %s\n", wifi_auto_connect ? "yes" : "no");
+        } else if (key == "audio_enabled") {
+            audio_enabled = (value == "yes" || value == "true" || value == "1");
+            Serial.printf("[BOOT_GUI] Loaded audio_enabled: %s\n", audio_enabled ? "yes" : "no");
         }
     }
     
@@ -441,6 +447,9 @@ static void saveSettings(void)
     file.printf("wifi_ssid=%s\n", wifi_ssid);
     file.printf("wifi_pass=%s\n", wifi_password);
     file.printf("wifi_auto=%s\n", wifi_auto_connect ? "yes" : "no");
+    
+    // Save audio settings
+    file.printf("audio_enabled=%s\n", audio_enabled ? "yes" : "no");
     
     file.close();
     Serial.println("[BOOT_GUI] Settings saved");
@@ -772,6 +781,42 @@ static void drawRadioButton(int x, int y, const char* label, bool selected)
     gfx.setTextSize(2);
     gfx.setTextDatum(ML_DATUM);
     gfx.drawString(label, x + RADIO_SIZE + 10, cy);
+}
+
+// ============================================================================
+// Drawing Functions - Checkbox
+// ============================================================================
+
+static void drawCheckbox(int x, int y, int size, const char* label, bool checked)
+{
+    // White background square
+    gfx.fillRect(x, y, size, size, MAC_WHITE);
+    
+    // Border
+    gfx.drawRect(x, y, size, size, MAC_BLACK);
+    gfx.drawRect(x + 1, y + 1, size - 2, size - 2, MAC_BLACK);
+    
+    // Draw checkmark if checked
+    if (checked) {
+        // Draw a simple X or checkmark
+        int margin = 6;
+        int x1 = x + margin;
+        int y1 = y + margin;
+        int x2 = x + size - margin;
+        int y2 = y + size - margin;
+        
+        // Draw thick checkmark lines
+        for (int i = -1; i <= 1; i++) {
+            gfx.drawLine(x1, y1 + size/4 + i, x + size/2, y2 + i, MAC_BLACK);
+            gfx.drawLine(x + size/2, y2 + i, x2, y1 + i, MAC_BLACK);
+        }
+    }
+    
+    // Label - larger text
+    gfx.setTextColor(MAC_BLACK);
+    gfx.setTextSize(2);
+    gfx.setTextDatum(ML_DATUM);
+    gfx.drawString(label, x + size + 10, y + size / 2);
 }
 
 // ============================================================================
@@ -1337,10 +1382,8 @@ static void runCountdownScreen(void)
                 gfx.drawString(info, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 40);
             }
             
-            // Draw WiFi status
-            if (wifi_connecting) {
-                gfx.drawString("WiFi: Connecting...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 80);
-            } else if (wifi_connected) {
+            // Draw WiFi status (below settings info)
+            if (wifi_connected) {
                 char wifi_info[64];
                 sprintf(wifi_info, "WiFi: %s", WiFi.localIP().toString().c_str());
                 gfx.drawString(wifi_info, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 80);
@@ -1348,9 +1391,13 @@ static void runCountdownScreen(void)
                 gfx.drawString("WiFi: Connection failed", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 80);
             }
             
-            // Draw countdown text
+            // Draw countdown text - show "WiFi Connecting..." when waiting for WiFi
             char countdown_text[32];
-            sprintf(countdown_text, "Starting in %d...", countdown);
+            if (wifi_connecting) {
+                sprintf(countdown_text, "WiFi Connecting...");
+            } else {
+                sprintf(countdown_text, "Starting in %d...", countdown);
+            }
             gfx.setTextSize(4);
             gfx.drawString(countdown_text, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 80);
             
@@ -1359,7 +1406,8 @@ static void runCountdownScreen(void)
             first_frame = false;
         } else {
             // Incremental updates - drawing directly to display
-            if (countdown_changed) {
+            // Update countdown text when countdown changes OR when wifi status changes
+            if (countdown_changed || wifi_status_changed) {
                 // Clear and redraw countdown region
                 gfx.fillRect(countdown_region_x, countdown_region_y, 
                                 countdown_region_w, countdown_region_h, MAC_LIGHT_GRAY);
@@ -1367,20 +1415,23 @@ static void runCountdownScreen(void)
                 gfx.setTextSize(4);
                 gfx.setTextDatum(MC_DATUM);
                 char countdown_text[32];
-                sprintf(countdown_text, "Starting in %d...", countdown);
+                if (wifi_connecting) {
+                    sprintf(countdown_text, "WiFi Connecting...");
+                } else {
+                    sprintf(countdown_text, "Starting in %d...", countdown);
+                }
                 gfx.drawString(countdown_text, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 80);
             }
             
             if (wifi_status_changed) {
-                // Clear and redraw WiFi status region
+                // Clear and redraw WiFi status region (below settings info)
                 gfx.fillRect(wifi_region_x, wifi_region_y, wifi_region_w, wifi_region_h, MAC_LIGHT_GRAY);
                 gfx.setTextColor(MAC_BLACK);
                 gfx.setTextSize(2);
                 gfx.setTextDatum(MC_DATUM);
                 
-                if (wifi_connecting) {
-                    gfx.drawString("WiFi: Connecting...", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 80);
-                } else if (wifi_connected) {
+                // Only show status line when not connecting (connecting is shown in main countdown)
+                if (wifi_connected) {
                     char wifi_info[64];
                     sprintf(wifi_info, "WiFi: %s", WiFi.localIP().toString().c_str());
                     gfx.drawString(wifi_info, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 80);
@@ -1451,6 +1502,12 @@ static void runSettingsScreen(void)
     int wifi_btn_x = SCREEN_WIDTH - SCREEN_MARGIN - wifi_btn_w;
     int wifi_btn_y = ram_y;
     
+    // Audio checkbox - second row below RAM radios
+    int audio_y = ram_y + RADIO_SIZE + 30;
+    int audio_x = content_x;
+    int audio_checkbox_x = audio_x + 80;  // After "Audio:" label
+    int audio_checkbox_size = RADIO_SIZE;
+    
     // Boot button - BIG and at bottom of screen
     int boot_btn_w = 400;
     int boot_btn_h = 80;
@@ -1464,6 +1521,12 @@ static void runSettingsScreen(void)
     int radio_region_y = ram_y - 5;
     int radio_region_w = radio_gap * 4 + 20;
     int radio_region_h = RADIO_SIZE + 30;
+    
+    // Audio checkbox region (for partial updates)
+    int audio_region_x = audio_x - 5;
+    int audio_region_y = audio_y - 5;
+    int audio_region_w = 300;
+    int audio_region_h = audio_checkbox_size + 20;
     
     // Debug: Print layout info
     Serial.printf("[BOOT_GUI] Layout: list_y=%d, list_h=%d, item_height=%d\n", list_y, list_h, LIST_ITEM_HEIGHT);
@@ -1482,6 +1545,7 @@ static void runSettingsScreen(void)
     int prev_disk_selection = disk_selection_index;
     int prev_cdrom_selection = cdrom_selection_index;
     int prev_ram_mb = selected_ram_mb;
+    bool prev_audio_enabled = audio_enabled;
     
     // Touch state - save position on press for use on release
     int touch_start_x = 0;
@@ -1490,6 +1554,7 @@ static void runSettingsScreen(void)
     bool touch_in_cdrom_list = false;
     bool touch_in_boot_btn = false;
     bool touch_in_wifi_btn = false;
+    bool touch_in_audio_checkbox = false;
     
     TouchEvent touch;
     
@@ -1497,6 +1562,7 @@ static void runSettingsScreen(void)
         bool disk_changed = false;
         bool cdrom_changed = false;
         bool ram_changed = false;
+        bool audio_changed = false;
         bool boot_btn_changed = false;
         bool wifi_btn_changed = false;
         
@@ -1510,6 +1576,7 @@ static void runSettingsScreen(void)
                 touch_in_cdrom_list = isPointInRect(touch_start_x, touch_start_y, cdrom_list_x, list_y, list_w, list_h);
                 touch_in_boot_btn = isPointInRect(touch_start_x, touch_start_y, boot_btn_x, boot_btn_y, boot_btn_w, boot_btn_h);
                 touch_in_wifi_btn = isPointInRect(touch_start_x, touch_start_y, wifi_btn_x, wifi_btn_y, wifi_btn_w, wifi_btn_h);
+                touch_in_audio_checkbox = isPointInRect(touch_start_x, touch_start_y, audio_x, audio_y, audio_region_w, audio_checkbox_size + 10);
                 
                 if (touch_in_boot_btn) {
                     boot_touch_started = true;
@@ -1520,8 +1587,8 @@ static void runSettingsScreen(void)
                     wifi_pressed = true;
                 }
                 
-                Serial.printf("[BOOT_GUI] Touch start at (%d, %d) disk=%d cdrom=%d boot=%d wifi=%d\n", 
-                              touch_start_x, touch_start_y, touch_in_disk_list, touch_in_cdrom_list, touch_in_boot_btn, touch_in_wifi_btn);
+                Serial.printf("[BOOT_GUI] Touch start at (%d, %d) disk=%d cdrom=%d boot=%d wifi=%d audio=%d\n", 
+                              touch_start_x, touch_start_y, touch_in_disk_list, touch_in_cdrom_list, touch_in_boot_btn, touch_in_wifi_btn, touch_in_audio_checkbox);
             }
             
             // Detect touch release - use saved position for hit testing
@@ -1579,11 +1646,18 @@ static void runSettingsScreen(void)
                     selected_ram_mb = 16;
                 }
                 
+                // Check Audio checkbox toggle
+                if (touch_in_audio_checkbox) {
+                    audio_enabled = !audio_enabled;
+                    Serial.printf("[BOOT_GUI] Audio toggled: %s\n", audio_enabled ? "enabled" : "disabled");
+                }
+                
                 // Reset touch state
                 touch_in_disk_list = false;
                 touch_in_cdrom_list = false;
                 touch_in_boot_btn = false;
                 touch_in_wifi_btn = false;
+                touch_in_audio_checkbox = false;
                 boot_touch_started = false;
                 boot_pressed = false;
                 wifi_touch_started = false;
@@ -1605,6 +1679,7 @@ static void runSettingsScreen(void)
         disk_changed = (disk_selection_index != prev_disk_selection);
         cdrom_changed = (cdrom_selection_index != prev_cdrom_selection);
         ram_changed = (selected_ram_mb != prev_ram_mb);
+        audio_changed = (audio_enabled != prev_audio_enabled);
         boot_btn_changed = (boot_pressed != prev_boot_pressed);
         wifi_btn_changed = (wifi_pressed != prev_wifi_pressed);
         
@@ -1637,6 +1712,9 @@ static void runSettingsScreen(void)
             drawRadioButton(radio_start_x + radio_gap * 2, ram_y, "12 MB", selected_ram_mb == 12);
             drawRadioButton(radio_start_x + radio_gap * 3, ram_y, "16 MB", selected_ram_mb == 16);
             
+            // Draw Audio checkbox
+            drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio (Buggy)", audio_enabled);
+            
             // Draw buttons
             drawButton(wifi_btn_x, wifi_btn_y, wifi_btn_w, wifi_btn_h, "WiFi", wifi_pressed);
             drawButton(boot_btn_x, boot_btn_y, boot_btn_w, boot_btn_h, "Boot", boot_pressed);
@@ -1662,6 +1740,12 @@ static void runSettingsScreen(void)
                 drawRadioButton(radio_start_x + radio_gap * 3, ram_y, "16 MB", selected_ram_mb == 16);
             }
             
+            if (audio_changed) {
+                // Clear and redraw audio checkbox region
+                gfx.fillRect(audio_region_x, audio_region_y, audio_region_w, audio_region_h, MAC_LIGHT_GRAY);
+                drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio (Buggy)", audio_enabled);
+            }
+            
             if (boot_btn_changed) {
                 drawButton(boot_btn_x, boot_btn_y, boot_btn_w, boot_btn_h, "Boot", boot_pressed);
             }
@@ -1675,6 +1759,7 @@ static void runSettingsScreen(void)
         prev_disk_selection = disk_selection_index;
         prev_cdrom_selection = cdrom_selection_index;
         prev_ram_mb = selected_ram_mb;
+        prev_audio_enabled = audio_enabled;
         prev_boot_pressed = boot_pressed;
         prev_wifi_pressed = wifi_pressed;
         
@@ -2433,6 +2518,11 @@ const char* BootGUI_GetWiFiPassword(void)
 bool BootGUI_GetWiFiAutoConnect(void)
 {
     return wifi_auto_connect;
+}
+
+bool BootGUI_GetAudioEnabled(void)
+{
+    return audio_enabled;
 }
 
 bool BootGUI_IsWiFiConnected(void)

@@ -281,4 +281,9 @@ extern void VideoSignalFrameReady(void);  // Signal video task that a new frame 
 extern void VideoMarkDirtyOffset(uint32 offset);     // Mark single byte dirty
 extern void VideoMarkDirtyRange(uint32 offset, uint32 size);  // Mark range dirty
 
+// Write-through queue functions - called from memory.cpp when VIDEO_USE_WRITE_THROUGH_QUEUE is enabled
+// These capture pixel data at write time to avoid PSRAM read-back during rendering
+extern void VideoQueueWrite(uint32_t offset, const uint8_t* data, uint32_t size);  // Queue pixel write
+extern void VideoTrackReadBack(uint32_t offset, uint32_t size);  // Track read-back for debugging
+
 #endif

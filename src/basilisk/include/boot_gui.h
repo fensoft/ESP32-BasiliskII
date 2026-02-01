@@ -79,6 +79,12 @@ const char* BootGUI_GetWiFiPassword(void);
 bool BootGUI_GetWiFiAutoConnect(void);
 
 /*
+ *  Check if audio is enabled
+ *  Returns true if emulator audio should be enabled
+ */
+bool BootGUI_GetAudioEnabled(void);
+
+/*
  *  Check if WiFi is currently connected
  *  Returns true if WiFi is connected and has an IP address
  */
