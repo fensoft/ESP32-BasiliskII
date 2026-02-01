@@ -24,7 +24,7 @@ A full port of the **BasiliskII** Macintosh 68k emulator to the ESP32-P4 microco
 </p>
 
 <p align="center">
-  <img src="screenshots/Internet-Sys7.png" width="70%" alt="Browsing the Internet on System 7"/>
+  <img src="screenshots/Internet-Sys7.jpg" width="70%" alt="Browsing the Internet on System 7"/>
 </p>
 
 *Browsing the web on System 7 via the built-in WiFi networking*
