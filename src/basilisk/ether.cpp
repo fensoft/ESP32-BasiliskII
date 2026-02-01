@@ -47,9 +47,8 @@
 #include "ether.h"
 #include "ether_defs.h"
 
-#ifndef NO_STD_NAMESPACE
-using std::map;
-#endif
+// Note: Don't use "using std::map" - conflicts with Arduino's map() function
+// Use std::map<> explicitly instead
 
 #define DEBUG 0
 #include "debug.h"

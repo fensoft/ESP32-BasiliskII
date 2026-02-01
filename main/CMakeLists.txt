@@ -27,7 +27,9 @@ set(BASILISK_SOURCES
     ${BASILISK_DIR}/xpram.cpp
     ${BASILISK_DIR}/audio_dummy.cpp
     ${BASILISK_DIR}/clip_dummy.cpp
-    ${BASILISK_DIR}/ether_dummy.cpp
+    ${BASILISK_DIR}/ether.cpp
+    ${BASILISK_DIR}/ether_esp32.cpp
+    ${BASILISK_DIR}/net_router.cpp
     ${BASILISK_DIR}/scsi_dummy.cpp
     ${BASILISK_DIR}/serial_dummy.cpp
 )

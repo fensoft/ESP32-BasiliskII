@@ -24,6 +24,12 @@ A full port of the **BasiliskII** Macintosh 68k emulator to the ESP32-P4 microco
 </p>
 
 <p align="center">
+  <img src="screenshots/Internet-Sys7.png" width="70%" alt="Browsing the Internet on System 7"/>
+</p>
+
+*Browsing the web on System 7 via the built-in WiFi networking*
+
+<p align="center">
   <a href="screenshots.md">
     <img src="https://img.shields.io/badge/🎬_View_Animations-Boot_Sequence_&_Flying_Toasters-blue?style=for-the-badge" alt="View Animations"/>
   </a>
@@ -227,7 +233,7 @@ The emulator works best with **Macintosh Quadra** series ROMs:
 
 Download a ready-to-use SD card image with Mac OS pre-installed:
 
-**[📥 Download sdCard.zip](https://mcchord.net/static/sdCard.zip)**
+**[📥 Download sdCard.zip](https://www.mcchord.net/static/sdCard.zip)**
 
 1. Format your microSD card as **FAT32**
 2. Extract the ZIP contents to the **root** of the SD card
@@ -337,6 +343,7 @@ On startup, a **classic Mac-style boot configuration screen** appears:
 │                                         │
 │    Disk: Macintosh.dsk                  │
 │    RAM: 8 MB                            │
+│    WiFi: 192.168.1.100                  │
 │                                         │
 │  ┌─────────────────────────────────┐    │
 │  │       Change Settings           │    │
@@ -347,7 +354,8 @@ On startup, a **classic Mac-style boot configuration screen** appears:
 ### Features
 
 - **3-second countdown** to auto-boot with saved settings
-- **Tap to configure** disk images, CD-ROMs, and RAM size
+- **Tap to configure** disk images, CD-ROMs, RAM size, and WiFi
+- **WiFi auto-connect** - countdown pauses while connecting
 - **Settings persistence** saved to `/basilisk_settings.txt` on SD card
 - **Touch-friendly** large buttons designed for the 5" touchscreen
 
@@ -358,6 +366,68 @@ On startup, a **classic Mac-style boot configuration screen** appears:
 | Hard Disk | Any `.dsk` or `.img` file on SD root | First found |
 | CD-ROM | Any `.iso` file on SD root, or None | None |
 | RAM Size | 4 MB, 8 MB, 12 MB, 16 MB | 8 MB |
+| WiFi | Configure SSID and password | None |
+
+### WiFi Setup
+
+To configure WiFi before booting:
+
+1. Tap **"Change Settings"** during the countdown
+2. Tap the **"WiFi"** button at the bottom of the settings screen
+3. The device will scan for available networks
+4. **Select a network** from the list
+5. **Tap the password field** to open the on-screen keyboard
+6. Enter your WiFi password and tap **"OK"**
+7. Tap **"Connect"** to connect to the network
+8. Once connected, tap **"Back"** to return to settings
+9. Tap **"Boot"** to start the emulator
+
+**Auto-Connect**: Once WiFi is configured, it will automatically connect on subsequent boots. The countdown screen will display:
+- "WiFi: Connecting..." while connecting
+- "WiFi: 192.168.x.x" once connected (shows your IP address)
+- "WiFi: Connection failed" if the connection fails
+
+The countdown will **pause while WiFi is connecting** (up to 10 seconds), ensuring the connection completes before booting into Mac OS.
+
+### Networking Support
+
+The emulator includes TCP/IP networking via the ESP32-C6 WiFi co-processor. This provides NAT-based internet access for classic Mac applications with built-in DHCP server support.
+
+**Virtual Network Configuration:**
+- MacOS IP: `10.0.2.15` (assigned via DHCP)
+- Gateway: `10.0.2.2`
+- DNS: `10.0.2.3` (forwarded to real DNS)
+
+**Supported Protocols:**
+- DHCP (automatic IP configuration)
+- TCP (web browsing, FTP, etc.)
+- UDP (DNS, NTP, etc.)
+- ICMP (ping)
+
+**WiFi Setup:**
+1. During the boot countdown, tap **"Change Settings"**
+2. Tap the **"WiFi"** button to open the WiFi configuration screen
+3. Select your network and enter the password using the on-screen keyboard
+4. Tap **"Connect"** - once connected, your IP will be displayed
+5. The connection is saved and will auto-connect on future boots
+
+**Mac OS Network Setup:**
+1. In MacOS 8.x, open **TCP/IP Control Panel** and set:
+   - Connect via: **Ethernet**
+   - Configure: **Using DHCP Server**
+   
+   That's it! DHCP will automatically configure all network settings.
+
+**Manual Configuration (if needed):**
+- IP Address: `10.0.2.15`
+- Subnet Mask: `255.255.255.0`
+- Router/Gateway: `10.0.2.2`
+- Name Server: `10.0.2.3`
+
+**Compatible Applications:**
+- MacTCP-based applications (Fetch, NCSA Telnet, etc.)
+- Open Transport applications (Netscape Navigator, Internet Explorer)
+- Ping utilities
 
 ---
 
@@ -404,6 +474,8 @@ M5Tab-Macintosh/
 │       ├── boot_gui.cpp            # Pre-boot configuration GUI
 │       ├── sys_esp32.cpp           # SD card disk I/O
 │       ├── timer_esp32.cpp         # 60Hz/1Hz interrupt generation
+│       ├── ether_esp32.cpp         # Network driver for WiFi NAT
+│       ├── net_router.cpp          # TCP/UDP/ICMP NAT router
 │       ├── xpram_esp32.cpp         # NVRAM persistence to SD
 │       ├── prefs_esp32.cpp         # Preferences loading
 │       ├── uae_cpu/                # Motorola 68040 CPU emulator

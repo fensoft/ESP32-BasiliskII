@@ -58,4 +58,37 @@ uint32_t BootGUI_GetRAMSize(void);
  */
 int BootGUI_GetRAMSizeMB(void);
 
+/*
+ *  Get the saved WiFi SSID
+ *  Returns pointer to static buffer with SSID
+ *  Returns empty string if no WiFi configured
+ */
+const char* BootGUI_GetWiFiSSID(void);
+
+/*
+ *  Get the saved WiFi password
+ *  Returns pointer to static buffer with password
+ *  Returns empty string if no WiFi configured
+ */
+const char* BootGUI_GetWiFiPassword(void);
+
+/*
+ *  Check if WiFi auto-connect is enabled
+ *  Returns true if WiFi should auto-connect on boot
+ */
+bool BootGUI_GetWiFiAutoConnect(void);
+
+/*
+ *  Check if WiFi is currently connected
+ *  Returns true if WiFi is connected and has an IP address
+ */
+bool BootGUI_IsWiFiConnected(void);
+
+/*
+ *  Get the current WiFi IP address
+ *  Returns IP address as a 32-bit value in host byte order
+ *  Returns 0 if not connected
+ */
+uint32_t BootGUI_GetWiFiIP(void);
+
 #endif // BOOT_GUI_H

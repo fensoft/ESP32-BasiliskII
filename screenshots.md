@@ -54,6 +54,32 @@ Serial output showing the v2.5 performance monitoring — CPU cycles, video fram
 
 ---
 
+## Networking Demo
+
+<p align="center">
+  <img src="screenshots/Internet-Sys7.png" width="80%" alt="Browsing the Internet on System 7"/>
+</p>
+
+Browsing the web on System 7 using the built-in WiFi networking via the ESP32-C6 co-processor.
+
+### Loading a Webpage Video
+
+Watch the emulator load a real webpage over WiFi:
+
+<p align="center">
+  <video src="screenshots/LoadingAWebpage.mp4" width="80%" controls>
+    Your browser does not support the video tag.
+  </video>
+</p>
+
+<p align="center">
+  <a href="screenshots/LoadingAWebpage.mp4">
+    <img src="https://img.shields.io/badge/▶_Download_Video-Loading_a_Webpage-green?style=for-the-badge" alt="Download Webpage Loading Video"/>
+  </a>
+</p>
+
+---
+
 ## Video
 
 For even higher quality footage, check out the boot video:

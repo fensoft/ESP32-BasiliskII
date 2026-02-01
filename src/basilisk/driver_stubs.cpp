@@ -13,8 +13,8 @@
 #include "macos_util.h"
 #include "scsi.h"
 #include "serial.h"
-#include "ether.h"
 #include "audio.h"
+// Note: ether.h not needed - real ethernet implementation in ether.cpp/ether_esp32.cpp
 #include "user_strings.h"
 
 /*
@@ -73,18 +73,9 @@ int16 SerialClose(uint32 pb, uint32 dce, int port) { (void)pb; (void)dce; (void)
 void SerialInterrupt(void) {}
 
 /*
- * Ethernet driver stubs
+ * Ethernet driver - real implementation in ether.cpp and ether_esp32.cpp
+ * (stubs removed to avoid duplicate symbols)
  */
-
-void EtherInit(void) {}
-void EtherExit(void) {}
-void EtherReset(void) {}
-void EtherInterrupt(void) {}
-int16 EtherOpen(uint32 pb, uint32 dce) { (void)pb; (void)dce; return noErr; }
-int16 EtherControl(uint32 pb, uint32 dce) { (void)pb; (void)dce; return noErr; }
-void EtherReadPacket(uint32 &src, uint32 &dest, uint32 &len, uint32 &remaining) {
-    (void)src; (void)dest; (void)len; (void)remaining;
-}
 
 /*
  * Audio driver stubs
