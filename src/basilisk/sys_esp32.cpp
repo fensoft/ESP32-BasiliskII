@@ -318,7 +318,7 @@ void Sys_close(void *arg)
         fh->file.close();
         fh->is_open = false;
     }
-    
+
     delete fh;
 }
 
@@ -329,6 +329,10 @@ size_t Sys_read(void *arg, void *buffer, loff_t offset, size_t length)
 {
     file_handle *fh = (file_handle *)arg;
     if (!fh || !fh->is_open || !buffer) {
+        return 0;
+    }
+
+    if (length == 0) {
         return 0;
     }
     
@@ -349,7 +353,7 @@ size_t Sys_write(void *arg, void *buffer, loff_t offset, size_t length)
     if (!fh || !fh->is_open || !buffer || fh->read_only) {
         return 0;
     }
-    
+
     if (!fh->file.seek(offset)) {
         return 0;
     }

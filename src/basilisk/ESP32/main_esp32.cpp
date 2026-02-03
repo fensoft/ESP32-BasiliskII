@@ -408,14 +408,44 @@ void FlushCodeCache(void *start, uint32 size)
 }
 
 /*
- *  Mutexes (dummy for single-threaded)
+ *  Mutex functions using FreeRTOS primitives for thread safety
  */
-struct B2_mutex { int dummy; };
+B2_mutex *B2_create_mutex(void)
+{
+    B2_mutex *m = new B2_mutex;
+    if (m) {
+        m->sem = xSemaphoreCreateMutex();
+        if (!m->sem) {
+            delete m;
+            return NULL;
+        }
+    }
+    return m;
+}
 
-B2_mutex *B2_create_mutex(void) { return new B2_mutex; }
-void B2_lock_mutex(B2_mutex *mutex) {}
-void B2_unlock_mutex(B2_mutex *mutex) {}
-void B2_delete_mutex(B2_mutex *mutex) { delete mutex; }
+void B2_lock_mutex(B2_mutex *mutex)
+{
+    if (mutex && mutex->sem) {
+        xSemaphoreTake(mutex->sem, portMAX_DELAY);
+    }
+}
+
+void B2_unlock_mutex(B2_mutex *mutex)
+{
+    if (mutex && mutex->sem) {
+        xSemaphoreGive(mutex->sem);
+    }
+}
+
+void B2_delete_mutex(B2_mutex *mutex)
+{
+    if (mutex) {
+        if (mutex->sem) {
+            vSemaphoreDelete(mutex->sem);
+        }
+        delete mutex;
+    }
+}
 
 /*
  *  Display alerts

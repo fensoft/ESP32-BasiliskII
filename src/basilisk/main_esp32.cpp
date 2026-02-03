@@ -54,7 +54,7 @@ extern uint32 MacFrameSize;
 extern int MacFrameLayout;
 
 // CPU and FPU type
-int CPUType = 4;           // 68040
+int CPUType = 2;           // 68020
 bool CPUIs68060 = false;
 int FPUType = 1;           // 68881
 bool TwentyFourBitAddressing = false;
@@ -68,9 +68,9 @@ void basilisk_loop(void);
 // CPU tick counter for timing (used by newcpu.cpp)
 // With video rendering offloaded to Core 0, we can use a much higher quantum
 // Higher quantum = less frequent periodic checks = faster emulation
-// Increased to 40000 with 15fps video for maximum emulation performance
-int32 emulated_ticks = 40000;
-static int32 emulated_ticks_quantum = 40000;
+// Increased to 80000 with 15fps video for maximum emulation performance
+int32 emulated_ticks = 80000;
+static int32 emulated_ticks_quantum = 80000;
 
 // ============================================================================
 // IPS (Instructions Per Second) Monitoring
@@ -226,26 +226,46 @@ static void stop60HzTimer(void)
 }
 
 /*
- *  Mutex functions (now using FreeRTOS primitives for thread safety)
+ *  Mutex functions using FreeRTOS primitives for thread safety
+ *  These are used to protect shared data structures between cores
+ *  (e.g., key_buffer accessed by input task on Core 0 and ADBInterrupt on Core 1)
  */
 B2_mutex *B2_create_mutex(void)
 {
-    return new B2_mutex;
+    B2_mutex *m = new B2_mutex;
+    if (m) {
+        m->sem = xSemaphoreCreateMutex();
+        if (!m->sem) {
+            Serial.println("[MUTEX] Failed to create FreeRTOS mutex");
+            delete m;
+            return NULL;
+        }
+    }
+    return m;
 }
 
 void B2_lock_mutex(B2_mutex *mutex)
 {
-    UNUSED(mutex);
+    if (mutex && mutex->sem) {
+        xSemaphoreTake(mutex->sem, portMAX_DELAY);
+    }
 }
 
 void B2_unlock_mutex(B2_mutex *mutex)
 {
-    UNUSED(mutex);
+    if (mutex && mutex->sem) {
+        xSemaphoreGive(mutex->sem);
+    }
 }
 
 void B2_delete_mutex(B2_mutex *mutex)
 {
-    delete mutex;
+    if (mutex) {
+        if (mutex->sem) {
+            vSemaphoreDelete(mutex->sem);
+        }
+        delete mutex;
+    }
 }
 
 /*
@@ -407,7 +427,7 @@ static bool InitEmulator(void)
     Serial.println("  BasiliskII ESP32 - Macintosh Emulator");
     Serial.println("  Dual-Core Optimized Edition");
     Serial.println("========================================\n");
-    
+
     // Print memory info including internal SRAM breakdown
     Serial.printf("[MAIN] Free heap: %d bytes\n", ESP.getFreeHeap());
     Serial.printf("[MAIN] Free PSRAM: %d bytes\n", ESP.getFreePsram());
@@ -419,6 +439,10 @@ static bool InitEmulator(void)
     size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     Serial.printf("[MAIN] Internal SRAM: %d/%d bytes free, largest block: %d bytes\n", 
                   free_internal, total_internal, largest_internal);
+
+    // Reserve opcode dispatch table early while internal SRAM is least fragmented
+    // This is the hottest path in CPU emulation and benefits greatly from internal SRAM
+    ReserveCpuFuncTable();
     
     Serial.printf("[MAIN] CPU Frequency: %d MHz\n", ESP.getCpuFreqMHz());
     Serial.printf("[MAIN] Running on Core: %d\n", xPortGetCoreID());
@@ -579,16 +603,19 @@ void basilisk_loop(void)
     uint32 current_time = millis();
     
     perf_loop_count++;
+
+    // Flush CPU-side dirty bitmap into shared bitmap for video task
+    VideoFlushDirtyTiles();
     
-    // Handle 60Hz tick (~16ms intervals)
-    if (current_time - last_60hz_time >= 16) {
-        last_60hz_time = current_time;
+    // Handle 60Hz tick (~16ms intervals) with catch-up if loop runs late
+    while (current_time - last_60hz_time >= 16) {
+        last_60hz_time += 16;
         handle_60hz_tick();
     }
     
-    // Handle 1Hz tick
-    if (current_time - last_second_time >= 1000) {
-        last_second_time = current_time;
+    // Handle 1Hz tick with catch-up
+    while (current_time - last_second_time >= 1000) {
+        last_second_time += 1000;
         handle_1hz_tick();
     }
     

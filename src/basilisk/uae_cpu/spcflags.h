@@ -54,18 +54,36 @@ enum {
 };
 
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+/* Local flags set by the CPU core (fast-path check) */
+#define SPCFLAGS_LOCAL_MASK (SPCFLAG_STOP | SPCFLAG_BRK | SPCFLAG_TRACE | SPCFLAG_DOTRACE | \
+	SPCFLAG_DOINT | SPCFLAG_JIT_END_COMPILE | SPCFLAG_JIT_EXEC_RETURN)
+extern volatile spcflags_t spcflags_local;
+#endif
+
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
 /* Atomic read for ESP32 dual-core safety */
 #define SPCFLAGS_TEST(m) \
 	((__atomic_load_n(&regs.spcflags, __ATOMIC_SEQ_CST) & (m)) != 0)
+/* Relaxed load for hot paths where ordering isn't required (faster) */
+#define SPCFLAGS_TEST_RELAXED(m) \
+	((__atomic_load_n(&regs.spcflags, __ATOMIC_RELAXED) & (m)) != 0)
 #else
 #define SPCFLAGS_TEST(m) \
 	((regs.spcflags & (m)) != 0)
+#define SPCFLAGS_TEST_RELAXED(m) SPCFLAGS_TEST(m)
 #endif
 
 /* Macro only used in m68k_reset() */
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+#define SPCFLAGS_INIT(m) do { \
+	regs.spcflags = (m); \
+	spcflags_local = ((m) & SPCFLAGS_LOCAL_MASK); \
+} while (0)
+#else
 #define SPCFLAGS_INIT(m) do { \
 	regs.spcflags = (m); \
 } while (0)
+#endif
 
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
 
@@ -76,11 +94,19 @@ enum {
 #define HAVE_HARDWARE_LOCKS
 
 #define SPCFLAGS_SET(m) do { \
-	__atomic_or_fetch(&regs.spcflags, (m), __ATOMIC_SEQ_CST); \
+	spcflags_t __m = (m); \
+	__atomic_or_fetch(&regs.spcflags, __m, __ATOMIC_SEQ_CST); \
+	if (__m & SPCFLAGS_LOCAL_MASK) { \
+		spcflags_local |= (__m & SPCFLAGS_LOCAL_MASK); \
+	} \
 } while (0)
 
 #define SPCFLAGS_CLEAR(m) do { \
-	__atomic_and_fetch(&regs.spcflags, ~(m), __ATOMIC_SEQ_CST); \
+	spcflags_t __m = (m); \
+	__atomic_and_fetch(&regs.spcflags, ~__m, __ATOMIC_SEQ_CST); \
+	if (__m & SPCFLAGS_LOCAL_MASK) { \
+		spcflags_local &= ~(__m & SPCFLAGS_LOCAL_MASK); \
+	} \
 } while (0)
 
 #elif !(ENABLE_EXCLUSIVE_SPCFLAGS)

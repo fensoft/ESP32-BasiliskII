@@ -81,6 +81,8 @@ static inline void *Mac2Mac_memcpy(uint32 dest, uint32 src, size_t n) {return me
 extern bool Init680x0(void);	// This routine may want to look at CPUType/FPUType to set up the apropriate emulation
 extern void Exit680x0(void);
 extern void InitFrameBufferMapping(void);
+// Early reservation of opcode dispatch table (ESP32 only)
+extern bool ReserveCpuFuncTable(void);
 
 // 680x0 dynamic recompilation activation flag
 #if USE_JIT

@@ -63,6 +63,44 @@ bool UseJIT = false;
 // From newcpu.cpp
 extern bool quit_program;
 
+/*
+ *  Reserve opcode dispatch table early (ESP32 only)
+ *  This grabs a large contiguous internal SRAM block before other allocations
+ *  fragment the heap, improving the odds of a fast cpufunctbl.
+ */
+bool ReserveCpuFuncTable(void)
+{
+#ifdef ARDUINO
+	if (cpufunctbl != NULL) {
+		return true;
+	}
+
+	size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+	size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+	write_log("Reserve cpufunctbl: internal SRAM %d bytes free (largest: %d)\n",
+	          free_internal, largest_internal);
+
+	// Prefer PSRAM to keep internal SRAM available for video buffers
+	cpufunctbl = (cpuop_func **)heap_caps_malloc(65536 * sizeof(cpuop_func *),
+	                                             MALLOC_CAP_SPIRAM);
+	if (cpufunctbl != NULL) {
+		write_log("Reserved cpufunctbl (256KB) in PSRAM early (freeing SRAM for video)\n");
+		return true;
+	}
+
+	// Fall back to internal SRAM if PSRAM allocation fails
+	cpufunctbl = (cpuop_func **)heap_caps_malloc(65536 * sizeof(cpuop_func *),
+	                                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	if (cpufunctbl != NULL) {
+		write_log("Reserved cpufunctbl (256KB) in internal SRAM (PSRAM alloc failed)\n");
+		return true;
+	}
+
+	write_log("Reserve cpufunctbl: allocation failed, will retry later\n");
+#endif
+	return false;
+}
+
 
 /*
  *  Initialize 680x0 emulation, CheckROM() must have been called first
@@ -82,19 +120,18 @@ bool Init680x0(void)
 		write_log("cpufunctbl allocation: need 256KB, internal SRAM has %d bytes free (largest: %d)\n",
 		          free_before, largest_block);
 		
-		// Try internal SRAM first - cpufunctbl is accessed once per instruction for dispatch
-		// This is the hot path for CPU emulation
-		cpufunctbl = (cpuop_func **)heap_caps_malloc(65536 * sizeof(cpuop_func *), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+		// Prefer PSRAM to keep internal SRAM for video buffers
+		cpufunctbl = (cpuop_func **)heap_caps_malloc(65536 * sizeof(cpuop_func *), MALLOC_CAP_SPIRAM);
 		if (cpufunctbl != NULL) {
-			write_log("Allocated cpufunctbl (256KB) in internal SRAM - FAST DISPATCH\n");
+			write_log("Allocated cpufunctbl (256KB) in PSRAM (video SRAM priority)\n");
 		} else {
-			// Fall back to PSRAM if internal SRAM not available
-			cpufunctbl = (cpuop_func **)heap_caps_malloc(65536 * sizeof(cpuop_func *), MALLOC_CAP_SPIRAM);
+			// Fall back to internal SRAM if PSRAM not available
+			cpufunctbl = (cpuop_func **)heap_caps_malloc(65536 * sizeof(cpuop_func *), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 			if (cpufunctbl == NULL) {
 				write_log("ERROR: Failed to allocate cpufunctbl!\n");
 				return false;
 			}
-			write_log("Allocated cpufunctbl (256KB) in PSRAM (fallback)\n");
+			write_log("Allocated cpufunctbl (256KB) in internal SRAM (PSRAM alloc failed)\n");
 		}
 	}
 #endif

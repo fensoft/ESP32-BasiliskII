@@ -27,6 +27,7 @@
 
 #ifdef ARDUINO
 #include <esp_heap_caps.h>
+#include <esp_attr.h>
 #endif
 
 #include "cpu_emulation.h"
@@ -350,34 +351,52 @@ static uae_u8 *REGPARAM2 frame_xlate(uaecptr addr) REGPARAM;
 
 static uintptr FrameBaseDiff;	// MacFrameBaseHost - MacFrameBaseMac
 
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
 uae_u32 REGPARAM2 frame_direct_lget(uaecptr addr)
 {
-    // Track read-back from video RAM for debugging
+    // Track read-back from video RAM for debugging (write-through queue only)
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
     VideoTrackReadBack(addr - MacFrameBaseMac, 4);
+#endif
     
     uae_u32 *m;
     m = (uae_u32 *)(FrameBaseDiff + addr);
     return do_get_mem_long(m);
 }
 
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
 uae_u32 REGPARAM2 frame_direct_wget(uaecptr addr)
 {
-    // Track read-back from video RAM for debugging
+    // Track read-back from video RAM for debugging (write-through queue only)
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
     VideoTrackReadBack(addr - MacFrameBaseMac, 2);
+#endif
     
     uae_u16 *m;
     m = (uae_u16 *)(FrameBaseDiff + addr);
     return do_get_mem_word(m);
 }
 
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
 uae_u32 REGPARAM2 frame_direct_bget(uaecptr addr)
 {
-    // Track read-back from video RAM for debugging
+    // Track read-back from video RAM for debugging (write-through queue only)
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
     VideoTrackReadBack(addr - MacFrameBaseMac, 1);
+#endif
     
     return (uae_u32)*(uae_u8 *)(FrameBaseDiff + addr);
 }
 
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
 void REGPARAM2 frame_direct_lput(uaecptr addr, uae_u32 l)
 {
     uae_u32 *m;
@@ -386,6 +405,7 @@ void REGPARAM2 frame_direct_lput(uaecptr addr, uae_u32 l)
     
     uint32_t offset = addr - MacFrameBaseMac;
     
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
     // Queue the write with pixel data (big-endian byte order as stored in Mac memory)
     uint8_t data[4];
     data[0] = (l >> 24) & 0xFF;
@@ -393,11 +413,15 @@ void REGPARAM2 frame_direct_lput(uaecptr addr, uae_u32 l)
     data[2] = (l >> 8) & 0xFF;
     data[3] = l & 0xFF;
     VideoQueueWrite(offset, data, 4);
+#endif
     
     // Mark dirty tiles for write-time tracking
     VideoMarkDirtyRange(offset, 4);
 }
 
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
 void REGPARAM2 frame_direct_wput(uaecptr addr, uae_u32 w)
 {
     uae_u16 *m;
@@ -406,26 +430,33 @@ void REGPARAM2 frame_direct_wput(uaecptr addr, uae_u32 w)
     
     uint32_t offset = addr - MacFrameBaseMac;
     
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
     // Queue the write with pixel data (big-endian byte order)
     uint8_t data[2];
     data[0] = (w >> 8) & 0xFF;
     data[1] = w & 0xFF;
     VideoQueueWrite(offset, data, 2);
+#endif
     
     // Mark dirty tiles for write-time tracking
     VideoMarkDirtyRange(offset, 2);
 }
 
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
 void REGPARAM2 frame_direct_bput(uaecptr addr, uae_u32 b)
 {
     *(uae_u8 *)(FrameBaseDiff + addr) = b;
     
     uint32_t offset = addr - MacFrameBaseMac;
     
+#if VIDEO_USE_WRITE_THROUGH_QUEUE
     // Queue the write with pixel data
     uint8_t data[1];
     data[0] = b & 0xFF;
     VideoQueueWrite(offset, data, 1);
+#endif
     
     // Mark dirty tile for write-time tracking
     VideoMarkDirtyOffset(offset);
@@ -758,4 +789,3 @@ uae_u32 get_virtual_address(uae_u8 *addr)
 }
 
 #endif /* !REAL_ADDRESSING && !DIRECT_ADDRESSING */
-

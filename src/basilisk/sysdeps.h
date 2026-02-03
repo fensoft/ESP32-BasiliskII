@@ -15,6 +15,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+// FreeRTOS for mutex support
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 // C++ STL headers needed by BasiliskII
 #include <vector>
 #include <map>
@@ -242,10 +246,10 @@ static inline int spin_trylock(b2_spinlock_t *lock) {
 }
 
 /*
- * Mutex implementation (single-threaded, no-op)
+ * Mutex implementation using FreeRTOS semaphores for thread safety
  */
 struct B2_mutex {
-    int dummy;
+    SemaphoreHandle_t sem;
 };
 
 /*

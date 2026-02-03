@@ -27,6 +27,13 @@
 using std::vector;
 #endif
 
+// Write-through queue for video updates.
+// Set to 1 to capture framebuffer writes at write-time and avoid PSRAM read-back.
+// Default is disabled for best overall performance on ESP32-P4.
+#ifndef VIDEO_USE_WRITE_THROUGH_QUEUE
+#define VIDEO_USE_WRITE_THROUGH_QUEUE 0
+#endif
+
 
 /*
    Some of the terminology here is completely frelled. In Basilisk II, a
@@ -274,6 +281,7 @@ extern void VideoQuitFullScreen(void);
 extern void VideoInterrupt(void);
 extern void VideoRefresh(void);
 extern void VideoSignalFrameReady(void);  // Signal video task that a new frame is ready (non-blocking)
+extern void VideoFlushDirtyTiles(void);
 
 // Write-time dirty tracking for framebuffer - called from memory.cpp on writes
 // These mark tiles dirty immediately when CPU writes to framebuffer, avoiding

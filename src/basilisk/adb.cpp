@@ -59,9 +59,11 @@ DRAM_ATTR static uint8 key_states[16];				// Key states (Mac keycodes)
 #define MATRIX(code) (key_states[code >> 3] & (1 << (~code & 7)))
 
 // Keyboard event buffer (Mac keycodes with up/down flag)
-const int KEY_BUFFER_SIZE = 16;
+// Increased from 16 to 64 to handle rapid typing and multi-key chords
+const int KEY_BUFFER_SIZE = 64;
 DRAM_ATTR static uint8 key_buffer[KEY_BUFFER_SIZE];
-static unsigned int key_read_ptr = 0, key_write_ptr = 0;
+// Volatile for cross-core visibility (input task on Core 0, ADBInterrupt on Core 1)
+static volatile unsigned int key_read_ptr = 0, key_write_ptr = 0;
 
 // O2S: Button event buffer (Mac button with up/down flag) -> avoid to loose tap on a trackpad
 const int BUTTON_BUFFER_SIZE = 32;
@@ -78,6 +80,9 @@ static uint8 m_keyboard_type = 0x05;
 // ADB mouse motion lock (for platforms that use separate input thread)
 static B2_mutex *mouse_lock;
 
+// Keyboard buffer lock (for thread-safe key buffer access between input task and ADBInterrupt)
+static B2_mutex *key_lock;
+
 
 /*
  *  Initialize ADB emulation
@@ -86,6 +91,7 @@ static B2_mutex *mouse_lock;
 void ADBInit(void)
 {
 	mouse_lock = B2_create_mutex();
+	key_lock = B2_create_mutex();
 	m_keyboard_type = (uint8)PrefsFindInt32("keyboardtype");
 	key_reg_3[1] = m_keyboard_type;
 }
@@ -100,6 +106,10 @@ void ADBExit(void)
 	if (mouse_lock) {
 		B2_delete_mutex(mouse_lock);
 		mouse_lock = NULL;
+	}
+	if (key_lock) {
+		B2_delete_mutex(key_lock);
+		key_lock = NULL;
 	}
 }
 
@@ -307,12 +317,25 @@ void ADBSetRelMouseMode(bool relative)
 
 void ADBKeyDown(int code)
 {
+	B2_lock_mutex(key_lock);
+
+	// Check for buffer overflow before writing
+	unsigned int next_write = (key_write_ptr + 1) % KEY_BUFFER_SIZE;
+	if (next_write == key_read_ptr) {
+		// Buffer full - drop event to prevent corruption
+		B2_unlock_mutex(key_lock);
+		D(bug("ADBKeyDown: key buffer overflow, dropping keycode 0x%02x\n", code));
+		return;
+	}
+
 	// Add keycode to buffer
 	key_buffer[key_write_ptr] = code;
-	key_write_ptr = (key_write_ptr + 1) % KEY_BUFFER_SIZE;
+	key_write_ptr = next_write;
 
 	// Set key in matrix
 	key_states[code >> 3] |= (1 << (~code & 7));
+
+	B2_unlock_mutex(key_lock);
 
 	// Trigger interrupt
 	SetInterruptFlag(INTFLAG_ADB);
@@ -326,12 +349,25 @@ void ADBKeyDown(int code)
 
 void ADBKeyUp(int code)
 {
+	B2_lock_mutex(key_lock);
+
+	// Check for buffer overflow before writing
+	unsigned int next_write = (key_write_ptr + 1) % KEY_BUFFER_SIZE;
+	if (next_write == key_read_ptr) {
+		// Buffer full - drop event to prevent corruption
+		B2_unlock_mutex(key_lock);
+		D(bug("ADBKeyUp: key buffer overflow, dropping keycode 0x%02x\n", code));
+		return;
+	}
+
 	// Add keycode to buffer
 	key_buffer[key_write_ptr] = code | 0x80;	// Key-up flag
-	key_write_ptr = (key_write_ptr + 1) % KEY_BUFFER_SIZE;
+	key_write_ptr = next_write;
 
 	// Clear key in matrix
 	key_states[code >> 3] &= ~(1 << (~code & 7));
+
+	B2_unlock_mutex(key_lock);
 
 	// Trigger interrupt
 	SetInterruptFlag(INTFLAG_ADB);
@@ -522,13 +558,20 @@ void ADBInterrupt(void)
 	}
 
 	// Process accumulated keyboard events
-	while (key_read_ptr != key_write_ptr) {
+	// Use mutex to safely read from the buffer (input task writes on Core 0)
+	while (true) {
+		B2_lock_mutex(key_lock);
+		if (key_read_ptr == key_write_ptr) {
+			B2_unlock_mutex(key_lock);
+			break;
+		}
 
-		// Read keyboard event
+		// Read keyboard event while holding mutex
 		uint8 mac_code = key_buffer[key_read_ptr];
 		key_read_ptr = (key_read_ptr + 1) % KEY_BUFFER_SIZE;
+		B2_unlock_mutex(key_lock);
 
-		// Call keyboard ADB handler
+		// Call keyboard ADB handler (outside mutex to avoid blocking input)
 		WriteMacInt8(tmp_data, 2);
 		WriteMacInt8(tmp_data + 1, mac_code);
 		WriteMacInt8(tmp_data + 2, mac_code == 0x7f ? 0x7f : 0xff);	// Power key is special

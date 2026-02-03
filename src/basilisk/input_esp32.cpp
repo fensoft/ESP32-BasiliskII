@@ -252,6 +252,27 @@ static bool touch_pending_click = false;  // Defer click until cursor has moved
 static int last_touch_x = 0;
 static int last_touch_y = 0;
 
+// Tap detection - distinguish taps from drags
+static int touch_start_x = 0;           // Position where touch started (Mac coords)
+static int touch_start_y = 0;
+static bool is_tap = true;              // False if movement exceeds threshold
+static bool mouse_down_sent = false;    // Track if we've sent mouse down
+static uint32_t touch_start_time = 0;   // When touch started (for timing)
+
+// Tap detection thresholds
+#define TAP_MOVEMENT_THRESHOLD 8        // Mac pixels - movement beyond this = drag
+#define TAP_MAX_DURATION_MS 300         // Max duration to still count as tap (not long-press)
+
+// Double-click detection
+static uint32_t last_click_time = 0;    // Time of last successful tap
+static int last_click_x = 0;            // Position of last click
+static int last_click_y = 0;
+#define DOUBLE_CLICK_TIME_MS 400        // Max time between clicks for double-click
+#define DOUBLE_CLICK_DISTANCE 15        // Max distance between clicks (Mac pixels)
+
+// Minimum click duration for quick taps
+#define MIN_CLICK_DURATION_MS 30        // Minimum time between down and up events
+
 // USB device connection state
 static bool keyboard_connected = false;
 static bool mouse_connected = false;
@@ -297,17 +318,38 @@ public:
     bool isAltHeld() { return (modifier_state & 0x44) != 0; }
     bool isCommandHeld() { return (modifier_state & 0x88) != 0; }
     
+    // Get combined mask for left+right variants of a modifier
+    // Bits 0,4 = Control, Bits 1,5 = Shift, Bits 2,6 = Alt, Bits 3,7 = GUI
+    uint8_t getCombinedMask(uint8_t bit) {
+        // Map bit 0-3 (left) or 4-7 (right) to combined mask
+        uint8_t base_bit = bit & 0x03;  // Get 0-3 regardless of left/right
+        return (1 << base_bit) | (1 << (base_bit + 4));  // Combine left and right
+    }
+    
     // Process a single modifier bit change
+    // Only sends key down when FIRST of left/right is pressed
+    // Only sends key up when BOTH left and right are released
     void handleModifierBit(uint8_t bit, bool pressed, uint8_t mac_keycode) {
         uint8_t mask = (1 << bit);
+        uint8_t combined_mask = getCombinedMask(bit);
         bool was_pressed = (modifier_state & mask) != 0;
+        bool either_was_pressed = (modifier_state & combined_mask) != 0;
         
         if (pressed && !was_pressed) {
+            // This side is being pressed
             modifier_state |= mask;
-            ADBKeyDown(mac_keycode);
+            // Only send key down if this is the first of left/right to be pressed
+            if (!either_was_pressed) {
+                ADBKeyDown(mac_keycode);
+            }
         } else if (!pressed && was_pressed) {
+            // This side is being released
             modifier_state &= ~mask;
-            ADBKeyUp(mac_keycode);
+            // Only send key up if both left and right are now released
+            bool either_still_pressed = (modifier_state & combined_mask) != 0;
+            if (!either_still_pressed) {
+                ADBKeyUp(mac_keycode);
+            }
         }
     }
     
@@ -556,8 +598,25 @@ static void convertTouchToMac(int touch_x, int touch_y, int *mac_x, int *mac_y)
 }
 
 /*
+ *  Calculate distance between two points
+ */
+static int touchDistance(int x1, int y1, int x2, int y2)
+{
+    int dx = x2 - x1;
+    int dy = y2 - y1;
+    // Use Manhattan distance for simplicity (faster than sqrt)
+    int dist = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
+    return dist;
+}
+
+/*
  *  Process touch panel input
  *  Called from InputPoll() to handle touch events
+ *  
+ *  Improved handling for:
+ *  - Tap detection (distinguish from drags via movement threshold)
+ *  - Double-click detection (track timing and position)
+ *  - Click position accuracy (tap registers at start position)
  */
 static void processTouchInput(void)
 {
@@ -574,49 +633,131 @@ static void processTouchInput(void)
     int mac_x, mac_y;
     convertTouchToMac(touch_x, touch_y, &mac_x, &mac_y);
     
+    uint32_t now = millis();
+    
     if (is_pressed) {
         if (!touch_was_pressed) {
-            // Touch just started - switch to absolute mode for touch
+            // ========== TOUCH START ==========
             ADBSetRelMouseMode(false);
             touch_was_pressed = true;
             
-            // Move cursor to touch position first
+            // Record starting position and time
+            touch_start_x = mac_x;
+            touch_start_y = mac_y;
+            touch_start_time = now;
+            is_tap = true;
+            mouse_down_sent = false;
+            
+            // Move cursor to touch position
             ADBMouseMoved(mac_x, mac_y);
             
-            // Defer the click until next poll cycle to ensure cursor has moved
-            // This prevents the "click before move" issue where the Mac processes
-            // the button event before the cursor position update takes effect
+            // Defer the click to allow position to be processed
             touch_pending_click = true;
+            
         } else {
-            // Check if we have a pending click from the previous cycle
-            if (touch_pending_click) {
-                // Now that cursor position has been processed, send the click
-                ADBMouseDown(0);
-                touch_pending_click = false;
+            // ========== TOUCH HELD ==========
+            // Calculate how far we've moved from start
+            int dist_from_start = touchDistance(mac_x, mac_y, touch_start_x, touch_start_y);
+            
+            // Check if movement exceeds tap threshold - this becomes a drag
+            if (is_tap && dist_from_start > TAP_MOVEMENT_THRESHOLD) {
+                is_tap = false;
+                
+                // For a drag, send mouse down at current position if not sent yet
+                if (!mouse_down_sent) {
+                    // Move to current position and press
+                    ADBMouseMoved(mac_x, mac_y);
+                    ADBMouseDown(0);
+                    mouse_down_sent = true;
+                    touch_pending_click = false;
+                }
             }
             
-            // Touch is being held/dragged
-            // Only update if position changed significantly (reduce noise)
-            int dx = mac_x - last_touch_x;
-            int dy = mac_y - last_touch_y;
-            if (dx != 0 || dy != 0) {
-                ADBMouseMoved(mac_x, mac_y);
+            // For drags, update cursor position continuously
+            if (!is_tap) {
+                int dx = mac_x - last_touch_x;
+                int dy = mac_y - last_touch_y;
+                if (dx != 0 || dy != 0) {
+                    ADBMouseMoved(mac_x, mac_y);
+                }
+            }
+            
+            // For taps, check if pending click should be sent
+            // (deferred one cycle to ensure position processed)
+            if (is_tap && touch_pending_click) {
+                // Keep cursor at start position for taps
+                ADBMouseMoved(touch_start_x, touch_start_y);
+                touch_pending_click = false;
+                // Don't send mouse down yet - wait for release to handle tap
             }
         }
         
         last_touch_x = mac_x;
         last_touch_y = mac_y;
+        
     } else {
         if (touch_was_pressed) {
-            // Touch just released
-            // If there was a pending click that never got sent (very quick tap),
-            // send click and release together
-            if (touch_pending_click) {
-                ADBMouseDown(0);
-                touch_pending_click = false;
+            // ========== TOUCH RELEASE ==========
+            uint32_t touch_duration = now - touch_start_time;
+            
+            if (is_tap && touch_duration < TAP_MAX_DURATION_MS) {
+                // This was a TAP - click at the start position
+                
+                // Ensure cursor is at tap position
+                ADBMouseMoved(touch_start_x, touch_start_y);
+                
+                // Check for double-click
+                uint32_t time_since_last = now - last_click_time;
+                int dist_from_last = touchDistance(touch_start_x, touch_start_y, 
+                                                    last_click_x, last_click_y);
+                
+                bool is_double_click = (last_click_time > 0) &&
+                                       (time_since_last < DOUBLE_CLICK_TIME_MS) &&
+                                       (dist_from_last < DOUBLE_CLICK_DISTANCE);
+                
+                if (is_double_click) {
+                    // Double-click detected - send two rapid clicks
+                    // First click
+                    ADBMouseDown(0);
+                    ADBMouseUp(0);
+                    // Small delay between clicks (handled by Mac processing)
+                    // Second click
+                    ADBMouseDown(0);
+                    ADBMouseUp(0);
+                    
+                    // Reset double-click tracking (prevent triple-click issues)
+                    last_click_time = 0;
+                } else {
+                    // Single tap - send click with minimum duration
+                    ADBMouseDown(0);
+                    
+                    // For very quick taps, we need the Mac to see the down state
+                    // The up will be processed in subsequent ADB interrupt
+                    ADBMouseUp(0);
+                    
+                    // Record for potential double-click
+                    last_click_time = now;
+                    last_click_x = touch_start_x;
+                    last_click_y = touch_start_y;
+                }
+                
+            } else {
+                // This was a DRAG or long-press - just release
+                if (mouse_down_sent) {
+                    ADBMouseUp(0);
+                } else if (touch_pending_click) {
+                    // Very quick touch that never sent down - send click now
+                    ADBMouseDown(0);
+                    ADBMouseUp(0);
+                }
+                
+                // Don't count drags/long-press as clicks for double-click detection
             }
-            ADBMouseUp(0);
+            
+            // Reset state
             touch_was_pressed = false;
+            touch_pending_click = false;
+            mouse_down_sent = false;
         }
     }
 }
@@ -705,6 +846,16 @@ bool InputInit(void)
     last_touch_x = 0;
     last_touch_y = 0;
     
+    // Initialize tap/double-click detection state
+    touch_start_x = 0;
+    touch_start_y = 0;
+    is_tap = true;
+    mouse_down_sent = false;
+    touch_start_time = 0;
+    last_click_time = 0;
+    last_click_x = 0;
+    last_click_y = 0;
+    
     // Initialize LED state
     last_led_state = 0;
     last_led_check_time = 0;
@@ -761,9 +912,12 @@ void InputExit(void)
     
     // Release any held buttons
     if (touch_was_pressed) {
-        touch_pending_click = false;
-        ADBMouseUp(0);
+        if (mouse_down_sent) {
+            ADBMouseUp(0);
+        }
         touch_was_pressed = false;
+        touch_pending_click = false;
+        mouse_down_sent = false;
     }
     
     // Cleanup USB Host
@@ -798,11 +952,15 @@ void InputSetTouchEnabled(bool enabled)
 {
     touch_enabled = enabled;
     if (!enabled && touch_was_pressed) {
-        if (touch_pending_click) {
-            touch_pending_click = false;
+        // Release mouse if it was pressed
+        if (mouse_down_sent) {
+            ADBMouseUp(0);
         }
-        ADBMouseUp(0);
+        // Reset all touch state
         touch_was_pressed = false;
+        touch_pending_click = false;
+        mouse_down_sent = false;
+        is_tap = true;
     }
 }
 

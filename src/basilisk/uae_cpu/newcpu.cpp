@@ -50,7 +50,14 @@ B2_mutex *spcflags_lock = NULL;
 #endif
 
 bool quit_program = false;
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+DRAM_ATTR struct flag_struct regflags;
+#else
 struct flag_struct regflags;
+#endif
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+DRAM_ATTR volatile spcflags_t spcflags_local = 0;
+#endif
 
 /* Opcode of faulting instruction */
 uae_u16 last_op_for_exception_3;
@@ -1450,9 +1457,9 @@ int m68k_do_specialties (void)
 // for ticks and special flags. This reduces overhead significantly.
 // The BATCH_SIZE controls how many instructions run before checking - higher
 // values improve performance but reduce interrupt responsiveness.
-// 32 instructions = good balance of performance vs responsiveness
-// Higher values (64, 128) give diminishing returns but less responsive interrupts
-#define EXEC_BATCH_SIZE 32
+// 1024 instructions = higher batch efficiency while still low latency
+// Higher values give diminishing returns and reduce responsiveness
+#define EXEC_BATCH_SIZE 1024
 
 // External tick counter (defined in main_esp32.cpp via newcpu.h)
 extern int32 emulated_ticks;
@@ -1463,37 +1470,80 @@ IRAM_ATTR
 #endif
 void m68k_do_execute (void)
 {
+	cpuop_func * const *func_table = cpufunctbl;
 	for (;;) {
 		// Execute a batch of instructions before checking ticks/flags
 		// This reduces the overhead of the tick check from every instruction
 		// to every EXEC_BATCH_SIZE instructions
-		int batch_count = EXEC_BATCH_SIZE;
-		int instructions_executed = 0;
-		
-		do {
+		int remaining = EXEC_BATCH_SIZE;
+
+		while (remaining >= 4) {
 			uae_u32 opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 			m68k_record_step(m68k_getpc());
 #endif
-			(*cpufunctbl[opcode])(opcode);
-			instructions_executed++;
-			
-			// Early exit if special flags are set (interrupts, etc.)
-			// This check is very fast (single memory read + compare)
-			if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+			(*func_table[opcode])(opcode);
+			if (unlikely(spcflags_local)) {
+				remaining--;
+				goto batch_done;
+			}
+
+			opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+			m68k_record_step(m68k_getpc());
+#endif
+			(*func_table[opcode])(opcode);
+			if (unlikely(spcflags_local)) {
+				remaining -= 2;
+				goto batch_done;
+			}
+
+			opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+			m68k_record_step(m68k_getpc());
+#endif
+			(*func_table[opcode])(opcode);
+			if (unlikely(spcflags_local)) {
+				remaining -= 3;
+				goto batch_done;
+			}
+
+			opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+			m68k_record_step(m68k_getpc());
+#endif
+			(*func_table[opcode])(opcode);
+			if (unlikely(spcflags_local)) {
+				remaining -= 4;
+				goto batch_done;
+			}
+
+			remaining -= 4;
+		}
+
+		while (remaining > 0) {
+			uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+			m68k_record_step(m68k_getpc());
+#endif
+			(*func_table[opcode])(opcode);
+			remaining--;
+			if (unlikely(spcflags_local)) {
 				break;
 			}
-		} while (--batch_count > 0);
+		}
 		
+batch_done:
 		// Decrement tick counter by number of instructions actually executed
 		// This maintains accurate instruction counting for IPS monitoring
+		int instructions_executed = EXEC_BATCH_SIZE - remaining;
 		emulated_ticks -= instructions_executed;
-		if (emulated_ticks <= 0) {
+		if (unlikely(emulated_ticks <= 0)) {
 			cpu_do_check_ticks();
 		}
 		
 		// Handle special conditions (interrupts, trace, etc.)
-		if (SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN)) {
+		if (SPCFLAGS_TEST_RELAXED(SPCFLAG_ALL_BUT_EXEC_RETURN)) {
 			if (m68k_do_specialties())
 				return;
 		}

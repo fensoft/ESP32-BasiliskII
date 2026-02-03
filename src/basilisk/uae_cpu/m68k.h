@@ -1075,4 +1075,13 @@ static __inline__ int cctrue(const int cc)
 
 #endif /* OPTIMIZED_FLAGS */
 
+/*
+ * Lazy flag evaluation support
+ * When USE_LAZY_FLAGS is defined, we override the flag macros with lazy versions
+ * that only compute flags when they are actually read.
+ */
+#ifdef USE_LAZY_FLAGS
+#include "lazy_flags.h"
+#endif
+
 #endif /* M68K_FLAGS_H */

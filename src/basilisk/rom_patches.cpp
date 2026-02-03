@@ -59,6 +59,7 @@ static uint32 debugutil_offset;		// ROM offset of DebugUtil() replacement routin
 // Prototypes
 uint16 ROMVersion;
 
+
 /*
  *  Macros used to extract one of the 16-bit words from a 32-bit word value
  */
