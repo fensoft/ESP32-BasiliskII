@@ -325,15 +325,15 @@ extern uaecptr last_fault_for_exception_3;
 #define CPU_OP_NAME(a) op ## a
 
 /* 68020 + 68881 */
-extern struct cputbl op_smalltbl_0_ff[];
+extern const struct cputbl op_smalltbl_0_ff[];
 /* 68020 */
-extern struct cputbl op_smalltbl_1_ff[];
+extern const struct cputbl op_smalltbl_1_ff[];
 /* 68010 */
-extern struct cputbl op_smalltbl_2_ff[];
+extern const struct cputbl op_smalltbl_2_ff[];
 /* 68000 */
-extern struct cputbl op_smalltbl_3_ff[];
+extern const struct cputbl op_smalltbl_3_ff[];
 /* 68000 slow but compatible.  */
-extern struct cputbl op_smalltbl_4_ff[];
+extern const struct cputbl op_smalltbl_4_ff[];
 
 #if FLIGHT_RECORDER
 extern void m68k_record_step(uaecptr) REGPARAM;

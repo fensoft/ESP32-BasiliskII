@@ -157,6 +157,17 @@ static ALWAYS_INLINE uae_u32 do_get_mem_word(uae_u16 *a) {
     return __builtin_bswap16(*a);
 }
 
+/*
+ * Fast opcode fetch path:
+ * On little-endian hosts, opcode words in emulated memory are stored byte-swapped.
+ * Expose the raw word so the CPU core can skip per-instruction bswap and instead
+ * use swapped opcode tables/bit extraction paths.
+ */
+#define HAVE_GET_WORD_UNSWAPPED 1
+static ALWAYS_INLINE uae_u32 do_get_mem_word_unswapped(const uae_u8 *a) {
+    return *(const uae_u16 *)a;
+}
+
 // Get 8-bit value from memory
 #define do_get_mem_byte(a) ((uae_u32)*((uae_u8 *)(a)))
 

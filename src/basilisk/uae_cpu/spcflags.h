@@ -53,6 +53,8 @@ enum {
 	SPCFLAG_ALL_BUT_EXEC_RETURN	= SPCFLAG_ALL & ~SPCFLAG_JIT_EXEC_RETURN
 };
 
+#define SPCFLAG_URGENT_MASK (SPCFLAG_STOP | SPCFLAG_BRK | SPCFLAG_TRACE | SPCFLAG_DOTRACE | SPCFLAG_JIT_END_COMPILE)
+
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
 /* Hot-path read in the CPU loop.
  * On ESP32-P4, aligned 32-bit loads are atomic; use a direct read to keep
@@ -71,6 +73,8 @@ enum {
 
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
 
+extern volatile spcflags_t spcflags_urgent;
+
 /*
  * ESP32 dual-core atomic operations using GCC builtins
  * Required for thread-safety when 60Hz timer runs on different core than CPU emulation
@@ -78,11 +82,19 @@ enum {
 #define HAVE_HARDWARE_LOCKS
 
 #define SPCFLAGS_SET(m) do { \
-	__atomic_or_fetch(&regs.spcflags, (m), __ATOMIC_RELAXED); \
+	const spcflags_t __m = (m); \
+	__atomic_or_fetch(&regs.spcflags, __m, __ATOMIC_RELAXED); \
+	if (__m & SPCFLAG_URGENT_MASK) { \
+		__atomic_or_fetch(&spcflags_urgent, (__m & SPCFLAG_URGENT_MASK), __ATOMIC_RELAXED); \
+	} \
 } while (0)
 
 #define SPCFLAGS_CLEAR(m) do { \
-	__atomic_and_fetch(&regs.spcflags, ~(m), __ATOMIC_RELAXED); \
+	const spcflags_t __m = (m); \
+	__atomic_and_fetch(&regs.spcflags, ~__m, __ATOMIC_RELAXED); \
+	if (__m & SPCFLAG_URGENT_MASK) { \
+		__atomic_and_fetch(&spcflags_urgent, ~(__m & SPCFLAG_URGENT_MASK), __ATOMIC_RELAXED); \
+	} \
 } while (0)
 
 #elif !(ENABLE_EXCLUSIVE_SPCFLAGS)

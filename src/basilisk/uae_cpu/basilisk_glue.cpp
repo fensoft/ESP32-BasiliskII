@@ -63,51 +63,62 @@ bool UseJIT = false;
 // From newcpu.cpp
 extern bool quit_program;
 
+#ifndef CPU_FORCE_PSRAM_DISPATCH
+#define CPU_FORCE_PSRAM_DISPATCH 0
+#endif
+
 /*
  *  Pre-allocate hot CPU data structures while internal SRAM is still contiguous.
  *  Safe to call multiple times.
  */
 bool PreallocateCPUHotData(void)
 {
-#ifdef ARDUINO
-	// Allocate 256KB opcode table early.
-	// This table is touched on every instruction dispatch, so internal SRAM helps.
-	if (cpufunctbl == NULL) {
-		size_t free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-		size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-		write_log("cpufunctbl prealloc: need 256KB, internal SRAM has %d bytes free (largest: %d)\n",
-		          free_before, largest_block);
+	#ifdef ARDUINO
+		// Allocate 256KB opcode table early.
+		if (cpufunctbl == NULL) {
+			size_t free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+			size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+			write_log("cpufunctbl prealloc: need 256KB, internal SRAM has %d bytes free (largest: %d)\n",
+			          free_before, largest_block);
 
-		cpufunctbl = (cpuop_func **)heap_caps_malloc(
-			65536 * sizeof(cpuop_func *),
-			MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT
-		);
-		if (cpufunctbl != NULL) {
-			cpufunctbl_in_spiram = false;
-			write_log("Preallocated cpufunctbl (256KB) in internal 32-bit memory - FAST DISPATCH\n");
-		} else {
-			cpufunctbl = (cpuop_func **)heap_caps_malloc(
-				65536 * sizeof(cpuop_func *),
-				MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
-			);
-			if (cpufunctbl != NULL) {
-				cpufunctbl_in_spiram = false;
-				write_log("Preallocated cpufunctbl (256KB) in internal SRAM (8-bit) - FAST DISPATCH\n");
-			} else {
+			if (!CPU_FORCE_PSRAM_DISPATCH) {
 				cpufunctbl = (cpuop_func **)heap_caps_malloc(
 					65536 * sizeof(cpuop_func *),
-					MALLOC_CAP_SPIRAM
+					MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT
 				);
-				if (cpufunctbl == NULL) {
-					write_log("ERROR: Failed to preallocate cpufunctbl!\n");
-					return false;
+				if (cpufunctbl != NULL) {
+					cpufunctbl_in_spiram = false;
+					write_log("Preallocated cpufunctbl (256KB) in internal 32-bit memory - FAST DISPATCH\n");
+					return true;
 				}
-				cpufunctbl_in_spiram = true;
+
+				cpufunctbl = (cpuop_func **)heap_caps_malloc(
+					65536 * sizeof(cpuop_func *),
+					MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+				);
+				if (cpufunctbl != NULL) {
+					cpufunctbl_in_spiram = false;
+					write_log("Preallocated cpufunctbl (256KB) in internal SRAM (8-bit) - FAST DISPATCH\n");
+					return true;
+				}
+			}
+
+			cpufunctbl = (cpuop_func **)heap_caps_malloc(
+				65536 * sizeof(cpuop_func *),
+				MALLOC_CAP_SPIRAM
+			);
+			if (cpufunctbl == NULL) {
+				write_log("ERROR: Failed to preallocate cpufunctbl!\n");
+				return false;
+			}
+			cpufunctbl_in_spiram = true;
+			if (CPU_FORCE_PSRAM_DISPATCH) {
+				write_log("Preallocated cpufunctbl (256KB) in PSRAM (forced)\n");
+			} else {
 				write_log("Preallocated cpufunctbl (256KB) in PSRAM (fallback)\n");
 			}
 		}
-	}
-#endif
+	#endif
 	return true;
 }
 

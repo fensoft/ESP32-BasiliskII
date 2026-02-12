@@ -391,10 +391,12 @@ void EtherInterrupt(void)
 static void net_rx_task(void *param)
 {
     Serial.println("[ETHER] Network RX task started");
+    uint16_t idle_polls = 0;
     
     while (net_rx_task_running) {
         // If WiFi has dropped, sleep longer to avoid busy-looping on dead sockets
         if (WiFi.status() != WL_CONNECTED) {
+            idle_polls = 0;
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -403,14 +405,28 @@ static void net_rx_task(void *param)
         router_poll();
         
         // If packets are available, signal the emulator
-        if (router_has_pending_packets()) {
+        bool has_pending = router_has_pending_packets();
+        if (has_pending) {
             if (SetInterruptFlagIfNew(INTFLAG_ETHER)) {
                 TriggerInterrupt();
             }
+            idle_polls = 0;
+        } else if (idle_polls < 0xFFFF) {
+            idle_polls++;
         }
         
-        // Small delay to avoid hogging CPU
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // Adaptive backoff:
+        // - active traffic: keep low latency
+        // - idle: poll less often to reduce Core 0 load and memory bus contention
+        uint32_t delay_ms = 5;
+        if (!has_pending) {
+            if (idle_polls > 40) {
+                delay_ms = 30;
+            } else if (idle_polls > 10) {
+                delay_ms = 10;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
     
     Serial.println("[ETHER] Network RX task stopped");

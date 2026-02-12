@@ -70,8 +70,8 @@ void basilisk_loop(void);
 // With video rendering offloaded to Core 0, we can use a much higher quantum
 // Higher quantum = less frequent periodic checks = faster emulation
 // Increased to 40000 with 15fps video for maximum emulation performance
-int32 emulated_ticks = 720000;
-static int32 emulated_ticks_quantum = 720000;
+int32 emulated_ticks = 12288000;
+static int32 emulated_ticks_quantum = 12288000;
 
 // ============================================================================
 // IPS (Instructions Per Second) Monitoring
@@ -157,10 +157,10 @@ static uint32 last_disk_flush_time = 0;
 
 // Video signal interval (ms) - how often to signal video task
 // The video task runs at its own pace, this just triggers buffer swap
-#define VIDEO_SIGNAL_INTERVAL 50  // ~20 FPS (balanced performance mode)
+#define VIDEO_SIGNAL_INTERVAL 49  // ~20 FPS target
 
 // Disk flush interval (ms) - how often to flush write buffer to SD card
-#define DISK_FLUSH_INTERVAL 2000  // 2 seconds
+#define DISK_FLUSH_INTERVAL 120000  // 120 seconds
 
 // FreeRTOS timers for periodic emulator events
 static TimerHandle_t timer_60hz = NULL;
@@ -178,7 +178,7 @@ static uint32 perf_flush_us = 0;             // Time spent in disk flush
 static uint32 perf_flush_count = 0;          // Number of flushes
 // NOTE: Input polling stats removed - input now runs on Core 0 task
 static uint32 perf_main_last_report = 0;     // Last time stats were printed
-#define PERF_MAIN_REPORT_INTERVAL_MS 5000    // Report every 5 seconds
+#define PERF_MAIN_REPORT_INTERVAL_MS 30000   // Report every 30 seconds
 
 /*
  *  Set/clear interrupt flags (thread-safe using atomic operations)

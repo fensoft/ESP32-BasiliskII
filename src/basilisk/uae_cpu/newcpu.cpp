@@ -50,6 +50,9 @@ B2_mutex *spcflags_lock = NULL;
 #endif
 
 bool quit_program = false;
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+volatile spcflags_t spcflags_urgent = 0;
+#endif
 struct flag_struct regflags;
 
 /* Opcode of faulting instruction */
@@ -129,6 +132,10 @@ bool cpufunctbl_in_spiram = false;
 
 #ifndef CPU_COMPACT_DISPATCH
 #define CPU_COMPACT_DISPATCH 1
+#endif
+
+#ifndef CPU_DEFER_DOINT_IN_BATCH
+#define CPU_DEFER_DOINT_IN_BATCH 1
 #endif
 
 #if CPU_COMPACT_DISPATCH
@@ -460,7 +467,7 @@ static void build_cpufunctbl (void)
 		else if (CPUType == 1)
 			cpu_level = 1;
 	}
-	struct cputbl *tbl = (
+	const struct cputbl *tbl = (
 				cpu_level == 4 ? op_smalltbl_0_ff
 				: cpu_level == 3 ? op_smalltbl_1_ff
 				: cpu_level == 2 ? op_smalltbl_2_ff
@@ -1644,9 +1651,9 @@ int m68k_do_specialties (void)
 // for ticks and special flags. This reduces overhead significantly.
 // The BATCH_SIZE controls how many instructions run before checking - higher
 // values improve performance but reduce interrupt responsiveness.
-// 1024 instructions amortizes loop bookkeeping while keeping responsiveness.
-// checking SPCFLAGS on every instruction.
-#define EXEC_BATCH_SIZE 4096
+// Larger batches reduce loop bookkeeping overhead on the ESP32-P4.
+// Keep this moderate so periodic checks stay responsive.
+#define EXEC_BATCH_SIZE 8192
 
 // External tick counter (defined in main_esp32.cpp via newcpu.h)
 extern int32 emulated_ticks;
@@ -1657,11 +1664,27 @@ IRAM_ATTR
 #endif
 void m68k_do_execute (void)
 {
-	for (;;) {
-		// Execute a batch of instructions before checking ticks/flags.
-		int batch_count = EXEC_BATCH_SIZE;
-		int instructions_executed = 0;
-		bool special_hit = false;
+#if CPU_DEFER_DOINT_IN_BATCH
+	// Handle asynchronous IRQ (DOINT/INT) at batch boundaries to reduce hot-loop
+	// churn, while still handling BRK/TRACE/STOP immediately for correctness.
+	const spcflags_t inner_break_flags = SPCFLAG_BRK
+	                                   | SPCFLAG_TRACE
+	                                   | SPCFLAG_DOTRACE
+	                                   | SPCFLAG_STOP
+	                                   | SPCFLAG_JIT_END_COMPILE;
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+#define CPU_INNER_SPECIAL_PENDING() (spcflags_urgent != 0)
+#else
+#define CPU_INNER_SPECIAL_PENDING() (__atomic_load_n(&regs.spcflags, __ATOMIC_RELAXED) & inner_break_flags)
+#endif
+#else
+	const spcflags_t inner_break_flags = SPCFLAG_ALL_BUT_EXEC_RETURN;
+#define CPU_INNER_SPECIAL_PENDING() (SPCFLAGS_TEST(inner_break_flags))
+#endif
+		for (;;) {
+			// Execute a batch of instructions before checking ticks/flags.
+			int batch_count = EXEC_BATCH_SIZE;
+			bool special_hit = false;
 
 		// Keep local copies of dispatch structures in this hot loop.
 		cpuop_func **const tbl = cpufunctbl;
@@ -1672,141 +1695,213 @@ void m68k_do_execute (void)
 
 #if CPU_COMPACT_DISPATCH
 		if (unlikely(compact_idx != NULL && compact_handlers != NULL)) {
-			while (batch_count >= 4) {
+			// Poll urgent flags once per 8 dispatched instructions.
+			while (batch_count >= 8) {
 				uae_u32 opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*compact_handlers[compact_idx[opcode]])(opcode);
-				instructions_executed++;
-				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
-					batch_count -= 1;
-					special_hit = true;
-					break;
-				}
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*compact_handlers[compact_idx[opcode]])(opcode);
-				instructions_executed++;
-				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
-					batch_count -= 2;
-					special_hit = true;
-					break;
-				}
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*compact_handlers[compact_idx[opcode]])(opcode);
-				instructions_executed++;
-				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
-					batch_count -= 3;
-					special_hit = true;
-					break;
-				}
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*compact_handlers[compact_idx[opcode]])(opcode);
-				instructions_executed++;
-				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
-					batch_count -= 4;
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+				batch_count -= 8;
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
 					special_hit = true;
 					break;
 				}
-
-				batch_count -= 4;
 			}
 
-			while (!special_hit && batch_count-- > 0) {
+			while (!special_hit && batch_count >= 4) {
 				uae_u32 opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*compact_handlers[compact_idx[opcode]])(opcode);
-				instructions_executed++;
-				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+				batch_count -= 4;
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+					special_hit = true;
 					break;
+				}
+			}
+
+				while (!special_hit && batch_count-- > 0) {
+					uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+					m68k_record_step(m68k_getpc());
+#endif
+					(*compact_handlers[compact_idx[opcode]])(opcode);
+					if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+						special_hit = true;
+						break;
 				}
 			}
 		} else
 #endif
 		{
-			// 4-way manual unroll reduces loop control overhead while preserving
-			// per-instruction SPCFLAG checks for correctness.
-			while (batch_count >= 4) {
+			// Poll urgent flags once per 8 dispatched instructions.
+			while (batch_count >= 8) {
 				uae_u32 opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
-				instructions_executed++;
-				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
-					batch_count -= 1;
-					special_hit = true;
-					break;
-				}
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
-				instructions_executed++;
-				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
-					batch_count -= 2;
-					special_hit = true;
-					break;
-				}
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
-				instructions_executed++;
-				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
-					batch_count -= 3;
-					special_hit = true;
-					break;
-				}
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
-				instructions_executed++;
-				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
-					batch_count -= 4;
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+				batch_count -= 8;
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
 					special_hit = true;
 					break;
 				}
+			}
 
+			while (!special_hit && batch_count >= 4) {
+				uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
 				batch_count -= 4;
-			}
-
-			while (!special_hit && batch_count-- > 0) {
-				uae_u32 opcode = GET_OPCODE;
-#if FLIGHT_RECORDER
-				m68k_record_step(m68k_getpc());
-#endif
-				(*tbl[opcode])(opcode);
-				instructions_executed++;
-				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+					special_hit = true;
 					break;
 				}
 			}
-		}
+
+				while (!special_hit && batch_count-- > 0) {
+					uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+					m68k_record_step(m68k_getpc());
+#endif
+					(*tbl[opcode])(opcode);
+					if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+						special_hit = true;
+						break;
+				}
+			}
+			}
+
+			// batch_count may be -1 when the scalar loop exits after final iteration.
+			const int instructions_executed =
+				EXEC_BATCH_SIZE - ((batch_count > 0) ? batch_count : 0);
 
 #if CPU_CORE_PROFILE
-		cpu_prof_batches++;
+			cpu_prof_batches++;
 		cpu_prof_instructions += instructions_executed;
 		if (special_hit) {
 			cpu_prof_special_breaks++;
@@ -1822,15 +1917,15 @@ void m68k_do_execute (void)
 		// Decrement tick counter by number of instructions actually executed
 		// This maintains accurate instruction counting for IPS monitoring
 		emulated_ticks -= instructions_executed;
-		if (emulated_ticks <= 0) {
+			if (emulated_ticks <= 0) {
 #if CPU_CORE_PROFILE
-			cpu_prof_tick_checks++;
+				cpu_prof_tick_checks++;
 #endif
-			cpu_do_check_ticks();
-		}
-		
-		// Handle special conditions (interrupts, trace, etc.)
-		if (SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN)) {
+				cpu_do_check_ticks();
+			}
+
+			// Handle special conditions (interrupts, trace, etc.)
+			if (SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN)) {
 #if CPU_CORE_PROFILE
 			cpu_prof_special_calls++;
 #endif
@@ -1838,6 +1933,8 @@ void m68k_do_execute (void)
 				return;
 		}
 	}
+
+#undef CPU_INNER_SPECIAL_PENDING
 }
 
 void reportCPUCorePerf(uint32 current_time_ms)

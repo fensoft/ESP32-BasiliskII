@@ -60,6 +60,10 @@
 #define DEBUG 1
 #include "debug.h"
 
+#ifndef VIDEO_DIRTY_MARK_NOOP
+#define VIDEO_DIRTY_MARK_NOOP 0
+#endif
+
 // Display configuration - 640x360 with 2x pixel doubling for 1280x720 display
 #define MAC_SCREEN_WIDTH  640
 #define MAC_SCREEN_HEIGHT 360
@@ -89,10 +93,10 @@
 
 // Video task configuration
 #define VIDEO_TASK_STACK_SIZE  8192
-#define VIDEO_TASK_PRIORITY    1
+#define VIDEO_TASK_PRIORITY    2
 #define VIDEO_TASK_CORE        0  // Run on Core 0, leaving Core 1 for CPU emulation
 // Keep cadence aligned with main-thread frame signaling for responsive video.
-#define VIDEO_MIN_FRAME_INTERVAL_MS 42
+#define VIDEO_MIN_FRAME_INTERVAL_MS 45
 
 // Frame buffer for Mac emulation (CPU writes here)
 static uint8 *mac_frame_buffer = NULL;
@@ -124,6 +128,12 @@ DRAM_ATTR static uint32 write_dirty_tiles[(TOTAL_TILES + 31) / 32];    // Tiles 
 // If CPU tries to write while this is set, the tile is re-marked dirty for next frame
 // This prevents torn data from race conditions during snapshot
 DRAM_ATTR static uint32 tile_render_active[(TOTAL_TILES + 31) / 32];   // Tiles currently being rendered
+
+// Lookup tables for fast 8-bit dirty-tile mapping.
+// Avoids repeated /40 and /640 math on the framebuffer write hot path.
+DRAM_ATTR static uint8 tile_col_lut[MAC_SCREEN_WIDTH];
+DRAM_ATTR static uint8 tile_row_base_lut[MAC_SCREEN_HEIGHT];
+static bool tile_lut_initialized = false;
 
 // Double-buffered row buffers for streaming full-frame renders with async DMA
 // Processes 4 Mac rows at a time (becomes 8 display rows with 2x scaling)
@@ -164,7 +174,7 @@ static volatile uint32_t perf_partial_count = 0;    // Partial updates
 static volatile uint32_t perf_full_count = 0;       // Full updates
 static volatile uint32_t perf_skip_count = 0;       // Skipped frames (no changes)
 static volatile uint32_t perf_last_report_ms = 0;   // Last time stats were printed
-#define PERF_REPORT_INTERVAL_MS 5000                // Report every 5 seconds
+#define PERF_REPORT_INTERVAL_MS 30000               // Report every 30 seconds
 
 // Monitor descriptor for ESP32
 class ESP32_monitor_desc : public monitor_desc {
@@ -263,6 +273,20 @@ static void updateVideoStateCache(video_depth depth, uint32 bytes_per_row)
     
     Serial.printf("[VIDEO] Mode cache updated: depth=%d, bpr=%d, ppb=%d\n", 
                   (int)depth, (int)bytes_per_row, current_pixels_per_byte);
+}
+
+static void initTileLuts(void)
+{
+    if (tile_lut_initialized) {
+        return;
+    }
+    for (int x = 0; x < MAC_SCREEN_WIDTH; x++) {
+        tile_col_lut[x] = (uint8)(x / TILE_WIDTH);
+    }
+    for (int y = 0; y < MAC_SCREEN_HEIGHT; y++) {
+        tile_row_base_lut[y] = (uint8)((y / TILE_HEIGHT) * TILES_X);
+    }
+    tile_lut_initialized = true;
 }
 
 /*
@@ -511,6 +535,35 @@ static inline bool isTileRenderActive(int tile_idx)
     return (__atomic_load_n(&tile_render_active[tile_idx / 32], __ATOMIC_ACQUIRE) & (1u << (tile_idx % 32))) != 0;
 }
 
+static inline void markTileDirtyBit(int tile_idx)
+{
+    __atomic_or_fetch(&write_dirty_tiles[tile_idx / 32], (1u << (tile_idx % 32)), __ATOMIC_RELAXED);
+}
+
+// Fast 8-bit path helper: convert framebuffer byte offset to tile index.
+static inline int fastTileIndex8Bit(uint32 offset)
+{
+    if (offset >= (uint32)(MAC_SCREEN_WIDTH * MAC_SCREEN_HEIGHT)) return -1;
+
+    // Writes are typically clustered on nearby rows; cache last resolved row.
+    static uint32 cached_row_base = 0xFFFFFFFFu;
+    static uint16 cached_row = 0;
+
+    uint32 row_base = cached_row_base;
+    uint32 y;
+    if (likely(row_base != 0xFFFFFFFFu && offset >= row_base && offset < (row_base + MAC_SCREEN_WIDTH))) {
+        y = cached_row;
+    } else {
+        y = offset / MAC_SCREEN_WIDTH;
+        row_base = y * MAC_SCREEN_WIDTH;
+        cached_row_base = row_base;
+        cached_row = (uint16)y;
+    }
+
+    uint32 x = offset - row_base;
+    return (int)(tile_row_base_lut[y] + tile_col_lut[x]);
+}
+
 /*
  *  Mark a tile as dirty at write-time (called from frame buffer put functions)
  *  This is MUCH faster than per-frame comparison as it only runs on actual writes.
@@ -530,7 +583,20 @@ static inline bool isTileRenderActive(int tile_idx)
  */
 void VideoMarkDirtyOffset(uint32 offset)
 {
+#if VIDEO_DIRTY_MARK_NOOP
+    UNUSED(offset);
+    return;
+#else
     if (offset >= frame_buffer_size) return;
+
+    // Hot path: 8-bit mode (default mode for this port).
+    if (likely(current_depth == VDEPTH_8BIT && current_bytes_per_row == MAC_SCREEN_WIDTH)) {
+        int tile_idx = fastTileIndex8Bit(offset);
+        if (tile_idx >= 0) {
+            markTileDirtyBit(tile_idx);
+        }
+        return;
+    }
     
     // Get current bytes per row (volatile)
     uint32 bpr = current_bytes_per_row;
@@ -561,9 +627,10 @@ void VideoMarkDirtyOffset(uint32 offset)
     for (int tile_x = tile_x_start; tile_x <= tile_x_end; tile_x++) {
         int tile_idx = tile_y * TILES_X + tile_x;
         if (tile_idx < TOTAL_TILES) {
-            __atomic_or_fetch(&write_dirty_tiles[tile_idx / 32], (1u << (tile_idx % 32)), __ATOMIC_RELAXED);
+            markTileDirtyBit(tile_idx);
         }
     }
+#endif
 }
 
 /*
@@ -580,11 +647,33 @@ void VideoMarkDirtyOffset(uint32 offset)
  */
 void VideoMarkDirtyRange(uint32 offset, uint32 size)
 {
+#if VIDEO_DIRTY_MARK_NOOP
+    UNUSED(offset);
+    UNUSED(size);
+    return;
+#else
     if (size == 0 || offset >= frame_buffer_size) return;
 
     // Clamp size to framebuffer bounds
     if (offset + size > frame_buffer_size) {
         size = frame_buffer_size - offset;
+    }
+
+    // Hot path: 8-bit mode with 2/4-byte writes.
+    if (size <= 4 && likely(current_depth == VDEPTH_8BIT && current_bytes_per_row == MAC_SCREEN_WIDTH)) {
+        int first_tile = fastTileIndex8Bit(offset);
+        if (first_tile >= 0) {
+            markTileDirtyBit(first_tile);
+        }
+
+        if (size > 1) {
+            uint32 end_offset = offset + size - 1;
+            int last_tile = fastTileIndex8Bit(end_offset);
+            if (last_tile >= 0 && last_tile != first_tile) {
+                markTileDirtyBit(last_tile);
+            }
+        }
+        return;
     }
 
     // Hot path: emulator memory writes are 2 or 4 bytes.
@@ -601,6 +690,7 @@ void VideoMarkDirtyRange(uint32 offset, uint32 size)
     // Generic fallback for larger ranges (currently unused in this port).
     VideoMarkDirtyOffset(offset);
     VideoMarkDirtyOffset(offset + size - 1);
+#endif
 }
 
 /*
@@ -617,12 +707,7 @@ static int collectWriteDirtyTiles(void)
         // Atomically read and clear the write dirty bitmap
         uint32 bits = __atomic_exchange_n(&write_dirty_tiles[i], 0, __ATOMIC_RELAXED);
         dirty_tiles[i] = bits;
-        
-        // Count set bits (popcount)
-        while (bits) {
-            count += (bits & 1);
-            bits >>= 1;
-        }
+        count += __builtin_popcount(bits);
     }
     
     return count;
@@ -1145,7 +1230,6 @@ static void videoRenderTaskOptimized(void *param)
         
         // RENDER - always use tile mode (faster than streaming even for full screen)
         if (dirty_tile_count > 0) {
-            // Render and push only dirty tiles
             t0 = micros();
             renderAndPushDirtyTiles(mac_frame_buffer, local_palette);
             t1 = micros();
@@ -1191,6 +1275,7 @@ bool VideoInit(bool classic)
     // Allocate Mac frame buffer in PSRAM
     // For 640x360 @ 8-bit = 230,400 bytes
     frame_buffer_size = MAC_SCREEN_WIDTH * MAC_SCREEN_HEIGHT;
+    initTileLuts();
     
     mac_frame_buffer = (uint8 *)ps_malloc(frame_buffer_size);
     if (!mac_frame_buffer) {

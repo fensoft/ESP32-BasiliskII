@@ -70,12 +70,21 @@ bool initSDCard() {
     // Initialize SPI with Tab5 SD card pins
     SPI.begin(SD_SPI_SCK, SD_SPI_MISO, SD_SPI_MOSI, SD_SPI_CS);
     
-    // Try to initialize SD card with explicit CS pin
-    if (!SD.begin(SD_SPI_CS, SPI, 25000000)) {
-        Serial.println("[MAIN] ERROR: SD card initialization failed!");
-        Serial.println("[MAIN] Make sure SD card is inserted and formatted as FAT32");
-        return false;
+    // Try fast SPI first, then fall back to a conservative speed for compatibility.
+    constexpr uint32_t kSdSpiFastHz = 40000000;
+    constexpr uint32_t kSdSpiSafeHz = 25000000;
+    uint32_t active_spi_hz = kSdSpiFastHz;
+    if (!SD.begin(SD_SPI_CS, SPI, kSdSpiFastHz)) {
+        Serial.printf("[MAIN] SD init at %u Hz failed, retrying at %u Hz\n", kSdSpiFastHz, kSdSpiSafeHz);
+        active_spi_hz = kSdSpiSafeHz;
+        if (!SD.begin(SD_SPI_CS, SPI, kSdSpiSafeHz)) {
+            Serial.println("[MAIN] ERROR: SD card initialization failed!");
+            Serial.println("[MAIN] Make sure SD card is inserted and formatted as FAT32");
+            return false;
+        }
     }
+
+    Serial.printf("[MAIN] SD SPI clock: %u Hz\n", active_spi_hz);
     
     uint64_t cardSize = SD.cardSize() / (1024 * 1024);
     Serial.printf("[MAIN] SD card initialized: %lluMB\n", cardSize);
@@ -105,7 +114,7 @@ void setup() {
     // Initialize M5Stack Tab5
     auto cfg = M5.config();
     M5.begin(cfg);
-    
+
     // Initialize serial
     Serial.begin(115200);
     delay(500);

@@ -57,6 +57,10 @@ void PlayStartupSound();
 #define IRQ_SOURCE_PROFILE 0
 #endif
 
+#ifndef VBL_TASK_TRAP_DIVISOR
+#define VBL_TASK_TRAP_DIVISOR 1
+#endif
+
 #if IRQ_SOURCE_PROFILE
 static uint64_t irq_prof_calls = 0;
 static uint64_t irq_prof_nonzero = 0;
@@ -530,7 +534,18 @@ void EmulOp(uint16 opcode, M68kRegisters *r)
 
 			const bool needs_started_check =
 				(irq_flags & (INTFLAG_60HZ | INTFLAG_1HZ | INTFLAG_ADB | INTFLAG_NMI)) != 0;
-			const bool mac_started = needs_started_check ? HasMacStarted() : false;
+			static bool mac_started_cached = false;
+			bool mac_started = false;
+			if (needs_started_check) {
+				if (mac_started_cached) {
+					mac_started = true;
+				} else {
+					mac_started = HasMacStarted();
+					if (mac_started) {
+						mac_started_cached = true;
+					}
+				}
+			}
 
 			if (irq_flags & INTFLAG_60HZ) {
 
@@ -547,9 +562,19 @@ void EmulOp(uint16 opcode, M68kRegisters *r)
 
 					// Call DoVBLTask(0)
 					if (ROMVersion == ROM_VERSION_32) {
+#if VBL_TASK_TRAP_DIVISOR <= 1
 						M68kRegisters r2;
 						r2.d[0] = 0;
 						Execute68kTrap(0xa072, &r2);
+#else
+						static uint8_t vbl_task_div_counter = 0;
+						if (++vbl_task_div_counter >= VBL_TASK_TRAP_DIVISOR) {
+							vbl_task_div_counter = 0;
+							M68kRegisters r2;
+							r2.d[0] = 0;
+							Execute68kTrap(0xa072, &r2);
+						}
+#endif
 					}
 
 					r->d[0] = 1;			// Flag: 68k interrupt routine executes VBLTasks etc.
