@@ -404,8 +404,9 @@ static void net_rx_task(void *param)
         
         // If packets are available, signal the emulator
         if (router_has_pending_packets()) {
-            SetInterruptFlag(INTFLAG_ETHER);
-            TriggerInterrupt();
+            if (SetInterruptFlagIfNew(INTFLAG_ETHER)) {
+                TriggerInterrupt();
+            }
         }
         
         // Small delay to avoid hogging CPU

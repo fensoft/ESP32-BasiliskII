@@ -63,6 +63,54 @@ bool UseJIT = false;
 // From newcpu.cpp
 extern bool quit_program;
 
+/*
+ *  Pre-allocate hot CPU data structures while internal SRAM is still contiguous.
+ *  Safe to call multiple times.
+ */
+bool PreallocateCPUHotData(void)
+{
+#ifdef ARDUINO
+	// Allocate 256KB opcode table early.
+	// This table is touched on every instruction dispatch, so internal SRAM helps.
+	if (cpufunctbl == NULL) {
+		size_t free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+		size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+		write_log("cpufunctbl prealloc: need 256KB, internal SRAM has %d bytes free (largest: %d)\n",
+		          free_before, largest_block);
+
+		cpufunctbl = (cpuop_func **)heap_caps_malloc(
+			65536 * sizeof(cpuop_func *),
+			MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT
+		);
+		if (cpufunctbl != NULL) {
+			cpufunctbl_in_spiram = false;
+			write_log("Preallocated cpufunctbl (256KB) in internal 32-bit memory - FAST DISPATCH\n");
+		} else {
+			cpufunctbl = (cpuop_func **)heap_caps_malloc(
+				65536 * sizeof(cpuop_func *),
+				MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+			);
+			if (cpufunctbl != NULL) {
+				cpufunctbl_in_spiram = false;
+				write_log("Preallocated cpufunctbl (256KB) in internal SRAM (8-bit) - FAST DISPATCH\n");
+			} else {
+				cpufunctbl = (cpuop_func **)heap_caps_malloc(
+					65536 * sizeof(cpuop_func *),
+					MALLOC_CAP_SPIRAM
+				);
+				if (cpufunctbl == NULL) {
+					write_log("ERROR: Failed to preallocate cpufunctbl!\n");
+					return false;
+				}
+				cpufunctbl_in_spiram = true;
+				write_log("Preallocated cpufunctbl (256KB) in PSRAM (fallback)\n");
+			}
+		}
+	}
+#endif
+	return true;
+}
+
 
 /*
  *  Initialize 680x0 emulation, CheckROM() must have been called first
@@ -70,34 +118,8 @@ extern bool quit_program;
 
 bool Init680x0(void)
 {
-#ifdef ARDUINO
-	// Allocate 256KB opcode table
-	// This table is accessed once per instruction for opcode dispatch
-	// NOTE: mem_banks gets priority for internal SRAM since it's accessed more frequently
-	// (multiple memory operations per instruction)
-	if (cpufunctbl == NULL) {
-		// Report available internal SRAM before allocation
-		size_t free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-		size_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-		write_log("cpufunctbl allocation: need 256KB, internal SRAM has %d bytes free (largest: %d)\n",
-		          free_before, largest_block);
-		
-		// Try internal SRAM first - cpufunctbl is accessed once per instruction for dispatch
-		// This is the hot path for CPU emulation
-		cpufunctbl = (cpuop_func **)heap_caps_malloc(65536 * sizeof(cpuop_func *), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-		if (cpufunctbl != NULL) {
-			write_log("Allocated cpufunctbl (256KB) in internal SRAM - FAST DISPATCH\n");
-		} else {
-			// Fall back to PSRAM if internal SRAM not available
-			cpufunctbl = (cpuop_func **)heap_caps_malloc(65536 * sizeof(cpuop_func *), MALLOC_CAP_SPIRAM);
-			if (cpufunctbl == NULL) {
-				write_log("ERROR: Failed to allocate cpufunctbl!\n");
-				return false;
-			}
-			write_log("Allocated cpufunctbl (256KB) in PSRAM (fallback)\n");
-		}
-	}
-#endif
+	if (!PreallocateCPUHotData())
+		return false;
 
 #if REAL_ADDRESSING
 	// Mac address space = host address space
@@ -186,8 +208,12 @@ void Start680x0(void)
 
 void TriggerInterrupt(void)
 {
-	idle_resume();
-	SPCFLAGS_SET( SPCFLAG_INT );
+	// Fast path: only perform wake-up work on the 0->1 transition.
+	// Repeated interrupt signals while DOINT is already pending are coalesced.
+	spcflags_t prev = __atomic_fetch_or(&regs.spcflags, SPCFLAG_DOINT, __ATOMIC_RELAXED);
+	if ((prev & SPCFLAG_DOINT) == 0) {
+		idle_resume();
+	}
 }
 
 void TriggerNMI(void)

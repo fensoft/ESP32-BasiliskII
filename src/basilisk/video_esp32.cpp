@@ -91,6 +91,8 @@
 #define VIDEO_TASK_STACK_SIZE  8192
 #define VIDEO_TASK_PRIORITY    1
 #define VIDEO_TASK_CORE        0  // Run on Core 0, leaving Core 1 for CPU emulation
+// Keep cadence aligned with main-thread frame signaling for responsive video.
+#define VIDEO_MIN_FRAME_INTERVAL_MS 42
 
 // Frame buffer for Mac emulation (CPU writes here)
 static uint8 *mac_frame_buffer = NULL;
@@ -578,64 +580,27 @@ void VideoMarkDirtyOffset(uint32 offset)
  */
 void VideoMarkDirtyRange(uint32 offset, uint32 size)
 {
-    if (offset >= frame_buffer_size) return;
-    
+    if (size == 0 || offset >= frame_buffer_size) return;
+
     // Clamp size to framebuffer bounds
     if (offset + size > frame_buffer_size) {
         size = frame_buffer_size - offset;
     }
-    
-    // Get current bytes per row (volatile)
-    uint32 bpr = current_bytes_per_row;
-    int ppb = current_pixels_per_byte;
-    
-    // Calculate start and end rows
-    int start_y = offset / bpr;
-    int end_y = (offset + size - 1) / bpr;
-    
-    // For small writes or writes within a single row, just mark individual bytes
-    if (end_y == start_y && size <= 4) {
-        // Simple case: mark start and end bytes
+
+    // Hot path: emulator memory writes are 2 or 4 bytes.
+    // Marking first and last touched bytes is sufficient here and avoids
+    // the expensive multi-row/full-row fallback path.
+    if (size <= 4) {
         VideoMarkDirtyOffset(offset);
         if (size > 1) {
             VideoMarkDirtyOffset(offset + size - 1);
         }
         return;
     }
-    
-    // For larger writes spanning multiple rows, calculate affected tile columns
-    // This is more efficient than marking every byte individually
-    int start_byte_in_row = offset % bpr;
-    int end_byte_in_row = (offset + size - 1) % bpr;
-    
-    // Calculate pixel columns affected
-    int pixel_col_start = start_byte_in_row * ppb;
-    int pixel_col_end = (end_byte_in_row + 1) * ppb - 1;
-    
-    // For writes spanning multiple rows, the middle rows are fully affected
-    // So we need to consider columns from 0 to end for complex cases
-    if (end_y > start_y) {
-        // Multi-row write: could affect any column
-        pixel_col_start = 0;
-        pixel_col_end = MAC_SCREEN_WIDTH - 1;
-    }
-    
-    // Calculate tile ranges
-    int tile_x_start = pixel_col_start / TILE_WIDTH;
-    int tile_x_end = pixel_col_end / TILE_WIDTH;
-    if (tile_x_end >= TILES_X) tile_x_end = TILES_X - 1;
-    
-    int tile_y_start = start_y / TILE_HEIGHT;
-    int tile_y_end = end_y / TILE_HEIGHT;
-    if (tile_y_end >= TILES_Y) tile_y_end = TILES_Y - 1;
-    
-    // Mark all affected tiles dirty
-    for (int tile_y = tile_y_start; tile_y <= tile_y_end; tile_y++) {
-        for (int tile_x = tile_x_start; tile_x <= tile_x_end; tile_x++) {
-            int tile_idx = tile_y * TILES_X + tile_x;
-            __atomic_or_fetch(&write_dirty_tiles[tile_idx / 32], (1u << (tile_idx % 32)), __ATOMIC_RELAXED);
-        }
-    }
+
+    // Generic fallback for larger ranges (currently unused in this port).
+    VideoMarkDirtyOffset(offset);
+    VideoMarkDirtyOffset(offset + size - 1);
 }
 
 /*
@@ -1119,18 +1084,17 @@ static void videoRenderTaskOptimized(void *param)
     // Initialize perf reporting timer
     perf_last_report_ms = millis();
     
-    // Minimum frame interval (42ms = ~24 FPS)
-    // 24fps is cinema standard and perceptually smooth
-    const TickType_t min_frame_ticks = pdMS_TO_TICKS(42);
+    // Minimum frame interval follows CPU-side signal cadence (~10 FPS by default).
+    // This keeps Core 0 and PSRAM bandwidth available for CPU emulation.
+    const TickType_t min_frame_ticks = pdMS_TO_TICKS(VIDEO_MIN_FRAME_INTERVAL_MS);
     TickType_t last_frame_ticks = xTaskGetTickCount();
     
     while (video_task_running) {
         // Note: Watchdog is configured with 10s timeout and no panic,
         // so we don't need to reset it frequently
         
-        // Event-driven: wait for frame signal with timeout
-        // This replaces the old polling loop - task sleeps until signaled
-        // Max wait time ensures we still render periodically even if no signal
+        // Event-driven: wait for frame signal with timeout.
+        // Timeout only exists as a safety net; normal rendering is signal-driven.
         uint32_t notification = ulTaskNotifyTake(pdTRUE, min_frame_ticks);
         
         // Also check legacy frame_ready flag for compatibility
@@ -1145,10 +1109,9 @@ static void videoRenderTaskOptimized(void *param)
             continue;
         }
         
-        // Only render if we have something to render
+        // Skip unsignaled wakeups unless we need to force a redraw.
         if (!should_render && !force_full_update) {
-            // Timeout with nothing to do - check for write-dirty tiles anyway
-            // This handles cases where writes happened but no explicit signal
+            continue;
         }
         
         uint32_t t0, t1;
@@ -1423,8 +1386,9 @@ void VideoQuitFullScreen(void)
  */
 void VideoInterrupt(void)
 {
-    // Trigger ADB interrupt for mouse/keyboard updates
-    SetInterruptFlag(INTFLAG_ADB);
+    // Input events now signal ADB directly from the input producers.
+    // Keep this hook for compatibility but avoid generating synthetic ADB IRQs
+    // at 60Hz, which creates extra interrupt churn.
 }
 
 /*

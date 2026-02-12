@@ -545,8 +545,8 @@ static int32 timer_func(void *arg)
 
 			// Timer expired, trigger interrupt
 			wakeup_time = 0x7fffffffffffffff;
-			SetInterruptFlag(INTFLAG_TIMER);
-			TriggerInterrupt();
+				if (SetInterruptFlagIfNew(INTFLAG_TIMER))
+					TriggerInterrupt();
 		}
 		release_sem(wakeup_time_sem);
 	}
@@ -569,8 +569,8 @@ static void *timer_func(void *arg)
 		timer_current_time(system_time);
 		if (timer_cmp_time(wakeup_time, system_time) < 0) {
 			wakeup_time = wakeup_time_max;
-			SetInterruptFlag(INTFLAG_TIMER);
-			TriggerInterrupt();
+				if (SetInterruptFlagIfNew(INTFLAG_TIMER))
+					TriggerInterrupt();
 		}
 		semaphore_signal(wakeup_time_sem);
 	}
@@ -593,8 +593,8 @@ static void *timer_func(void *arg)
 			pthread_mutex_lock(&wakeup_time_lock);
 			wakeup_time = wakeup_time_max;
 			pthread_mutex_unlock(&wakeup_time_lock);
-			SetInterruptFlag(INTFLAG_TIMER);
-			TriggerInterrupt();
+				if (SetInterruptFlagIfNew(INTFLAG_TIMER))
+					TriggerInterrupt();
 		}
 	}
 	return NULL;

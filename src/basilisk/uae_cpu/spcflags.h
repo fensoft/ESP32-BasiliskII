@@ -54,9 +54,11 @@ enum {
 };
 
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
-/* Atomic read for ESP32 dual-core safety */
+/* Hot-path read in the CPU loop.
+ * On ESP32-P4, aligned 32-bit loads are atomic; use a direct read to keep
+ * the instruction dispatch path as lean as possible. */
 #define SPCFLAGS_TEST(m) \
-	((__atomic_load_n(&regs.spcflags, __ATOMIC_SEQ_CST) & (m)) != 0)
+	((regs.spcflags & (m)) != 0)
 #else
 #define SPCFLAGS_TEST(m) \
 	((regs.spcflags & (m)) != 0)
@@ -76,11 +78,11 @@ enum {
 #define HAVE_HARDWARE_LOCKS
 
 #define SPCFLAGS_SET(m) do { \
-	__atomic_or_fetch(&regs.spcflags, (m), __ATOMIC_SEQ_CST); \
+	__atomic_or_fetch(&regs.spcflags, (m), __ATOMIC_RELAXED); \
 } while (0)
 
 #define SPCFLAGS_CLEAR(m) do { \
-	__atomic_and_fetch(&regs.spcflags, ~(m), __ATOMIC_SEQ_CST); \
+	__atomic_and_fetch(&regs.spcflags, ~(m), __ATOMIC_RELAXED); \
 } while (0)
 
 #elif !(ENABLE_EXCLUSIVE_SPCFLAGS)

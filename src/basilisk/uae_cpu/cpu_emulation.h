@@ -78,6 +78,7 @@ static inline void *Mac2Mac_memcpy(uint32 dest, uint32 src, size_t n) {return me
  */
 
 // Initialization
+extern bool PreallocateCPUHotData(void);	// Try to reserve hot CPU tables before subsystem init fragments internal SRAM
 extern bool Init680x0(void);	// This routine may want to look at CPUType/FPUType to set up the apropriate emulation
 extern void Exit680x0(void);
 extern void InitFrameBufferMapping(void);
@@ -98,5 +99,6 @@ extern "C" void Execute68kTrap(uint16 trap, M68kRegisters *r);	// Execute MacOS 
 // Interrupt functions
 extern void TriggerInterrupt(void);								// Trigger interrupt level 1 (InterruptFlag must be set first)
 extern void TriggerNMI(void);									// Trigger interrupt level 7
+extern void reportIRQProfile(uint32 current_time_ms);				// Optional IRQ-source profiler (no-op unless enabled)
 
 #endif

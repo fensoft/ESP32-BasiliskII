@@ -29,6 +29,8 @@ struct file_handle {
     bool is_floppy;
     bool is_cdrom;
     bool is_dirty;      // Track if there are pending writes to flush
+    bool pos_valid;     // Track cached file position to avoid redundant seek()
+    loff_t pos;         // Current file position when pos_valid is true
     loff_t size;
     char path[256];
 };
@@ -296,6 +298,8 @@ void *Sys_open(const char *name, bool read_only, bool is_cdrom)
     }
     
     fh->is_open = true;
+    fh->pos = 0;
+    fh->pos_valid = true;
     register_file_handle(fh);
     
     Serial.printf("[SYS] Opened %s (%lld KB, ro=%d)\n", 
@@ -331,12 +335,21 @@ size_t Sys_read(void *arg, void *buffer, loff_t offset, size_t length)
     if (!fh || !fh->is_open || !buffer) {
         return 0;
     }
-    
-    if (!fh->file.seek(offset)) {
-        return 0;
+
+    if (!fh->pos_valid || fh->pos != offset) {
+        if (!fh->file.seek(offset)) {
+            fh->pos_valid = false;
+            return 0;
+        }
+        fh->pos = offset;
+        fh->pos_valid = true;
     }
-    
-    return fh->file.read((uint8_t *)buffer, length);
+
+    size_t read_len = fh->file.read((uint8_t *)buffer, length);
+    if (read_len > 0) {
+        fh->pos += (loff_t)read_len;
+    }
+    return read_len;
 }
 
 /*
@@ -349,14 +362,20 @@ size_t Sys_write(void *arg, void *buffer, loff_t offset, size_t length)
     if (!fh || !fh->is_open || !buffer || fh->read_only) {
         return 0;
     }
-    
-    if (!fh->file.seek(offset)) {
-        return 0;
+
+    if (!fh->pos_valid || fh->pos != offset) {
+        if (!fh->file.seek(offset)) {
+            fh->pos_valid = false;
+            return 0;
+        }
+        fh->pos = offset;
+        fh->pos_valid = true;
     }
-    
+
     size_t written = fh->file.write((uint8_t *)buffer, length);
     if (written > 0) {
         fh->is_dirty = true;  // Mark for deferred flush
+        fh->pos += (loff_t)written;
     }
     return written;
 }

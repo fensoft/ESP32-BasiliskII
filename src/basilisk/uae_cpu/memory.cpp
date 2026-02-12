@@ -611,20 +611,30 @@ void memory_init(void)
 		write_log("mem_banks allocation: need 256KB, internal SRAM has %d bytes free (largest: %d)\n",
 		          free_before, largest_block);
 		
-		// Try PSRAM first - cpufunctbl gets priority for internal SRAM
-		// (cpufunctbl dispatch is per-instruction, mem_banks is per-memory-access but
-		// memory functions themselves do the heavy lifting)
-		mem_banks = (addrbank **)heap_caps_malloc(65536 * sizeof(addrbank *), MALLOC_CAP_SPIRAM);
+		// Prefer internal 32-bit memory for pointer-table lookups in the hot path.
+		mem_banks = (addrbank **)heap_caps_malloc(
+			65536 * sizeof(addrbank *),
+			MALLOC_CAP_INTERNAL | MALLOC_CAP_32BIT
+		);
 		if (mem_banks != NULL) {
-			write_log("Allocated mem_banks (256KB) in PSRAM (cpufunctbl has SRAM priority)\n");
+			write_log("Allocated mem_banks (256KB) in internal 32-bit memory\n");
 		} else {
-			// Fall back to internal SRAM if PSRAM fails
-			mem_banks = (addrbank **)heap_caps_malloc(65536 * sizeof(addrbank *), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-			if (mem_banks == NULL) {
-				write_log("ERROR: Failed to allocate mem_banks!\n");
-				return;
+			// Fall back to PSRAM when internal pools are too fragmented.
+			mem_banks = (addrbank **)heap_caps_malloc(65536 * sizeof(addrbank *), MALLOC_CAP_SPIRAM);
+			if (mem_banks != NULL) {
+				write_log("Allocated mem_banks (256KB) in PSRAM (fallback)\n");
+			} else {
+				// Final fallback: byte-addressable internal SRAM.
+				mem_banks = (addrbank **)heap_caps_malloc(
+					65536 * sizeof(addrbank *),
+					MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+				);
+				if (mem_banks == NULL) {
+					write_log("ERROR: Failed to allocate mem_banks!\n");
+					return;
+				}
+				write_log("Allocated mem_banks (256KB) in internal SRAM (8-bit fallback)\n");
 			}
-			write_log("Allocated mem_banks (256KB) in internal SRAM (fallback)\n");
 		}
 	}
 #endif
@@ -721,4 +731,3 @@ uae_u32 get_virtual_address(uae_u8 *addr)
 }
 
 #endif /* !REAL_ADDRESSING && !DIRECT_ADDRESSING */
-

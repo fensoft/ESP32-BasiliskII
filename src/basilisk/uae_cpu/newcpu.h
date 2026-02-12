@@ -67,8 +67,9 @@ struct cputbl {
     uae_u16 opcode;
 };
 
-// Note: cpufunctbl is dynamically allocated in PSRAM on ESP32
+// Opcode dispatch table (64K entries)
 extern cpuop_func **cpufunctbl;
+extern bool cpufunctbl_in_spiram;
 
 #if USE_JIT
 typedef void compop_func (uae_u32) REGPARAM;
@@ -82,6 +83,7 @@ struct comptbl {
 
 extern void REGPARAM2 op_illg (uae_u32) REGPARAM;
 extern void m68k_dumpstate(uaecptr *nextpc);
+extern void reportCPUCorePerf(uint32 current_time_ms);
 
 typedef char flagtype;
 

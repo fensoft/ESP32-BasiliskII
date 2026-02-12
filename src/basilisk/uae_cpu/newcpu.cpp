@@ -123,8 +123,168 @@ const int movem_next[256] = {
     224,240,240,242,240,244,244,246,240,248,248,250,248,252,252,254,
 };
 
-// 256KB opcode lookup table - dynamically allocated in PSRAM on ESP32
+// 256KB opcode lookup table - dynamically allocated
 cpuop_func **cpufunctbl = NULL;
+bool cpufunctbl_in_spiram = false;
+
+#ifndef CPU_COMPACT_DISPATCH
+#define CPU_COMPACT_DISPATCH 1
+#endif
+
+#if CPU_COMPACT_DISPATCH
+static uae_u16 *compact_dispatch_index = NULL;       // 128KB (65536 x u16), internal SRAM
+static cpuop_func **compact_dispatch_handlers = NULL; // unique handlers, internal SRAM
+static uae_u16 compact_dispatch_handler_count = 0;
+
+static void free_compact_dispatch(void)
+{
+#ifdef ARDUINO
+	if (compact_dispatch_index != NULL) {
+		heap_caps_free(compact_dispatch_index);
+		compact_dispatch_index = NULL;
+	}
+	if (compact_dispatch_handlers != NULL) {
+		heap_caps_free(compact_dispatch_handlers);
+		compact_dispatch_handlers = NULL;
+	}
+#else
+	free(compact_dispatch_index);
+	compact_dispatch_index = NULL;
+	free(compact_dispatch_handlers);
+	compact_dispatch_handlers = NULL;
+#endif
+	compact_dispatch_handler_count = 0;
+}
+
+/*
+ * Build a compact opcode dispatch format:
+ *   opcode -> 16-bit handler index (in internal SRAM)
+ *   handler index -> function pointer (in internal SRAM)
+ *
+ * This avoids a 256KB PSRAM pointer fetch on every instruction when cpufunctbl
+ * falls back to PSRAM, while preserving exact dispatch semantics.
+ */
+static bool build_compact_dispatch(void)
+{
+#ifdef ARDUINO
+	if (!cpufunctbl_in_spiram || cpufunctbl == NULL) {
+		return false;
+	}
+
+	if (compact_dispatch_index != NULL && compact_dispatch_handlers != NULL) {
+		return true;
+	}
+
+	free_compact_dispatch();
+
+	const size_t opcode_count = 65536;
+	const size_t hash_size = 16384; // power-of-two
+	const size_t hash_mask = hash_size - 1;
+
+	struct hash_entry {
+		uintptr_t key;
+		uae_u16 idx;
+	};
+
+	uae_u16 *index_tbl = (uae_u16 *)heap_caps_malloc(
+		opcode_count * sizeof(uae_u16),
+		MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+	);
+	if (index_tbl == NULL) {
+		write_log("Compact dispatch: failed to allocate 128KB index table in internal SRAM\n");
+		return false;
+	}
+
+	hash_entry *hash_tbl = (hash_entry *)heap_caps_malloc(
+		hash_size * sizeof(hash_entry),
+		MALLOC_CAP_SPIRAM
+	);
+	if (hash_tbl == NULL) {
+		heap_caps_free(index_tbl);
+		write_log("Compact dispatch: failed to allocate hash table in PSRAM\n");
+		return false;
+	}
+	memset(hash_tbl, 0, hash_size * sizeof(hash_entry));
+
+	cpuop_func **tmp_handlers = (cpuop_func **)heap_caps_malloc(
+		opcode_count * sizeof(cpuop_func *),
+		MALLOC_CAP_SPIRAM
+	);
+	if (tmp_handlers == NULL) {
+		heap_caps_free(hash_tbl);
+		heap_caps_free(index_tbl);
+		write_log("Compact dispatch: failed to allocate temporary handler list in PSRAM\n");
+		return false;
+	}
+
+	uae_u16 unique_count = 0;
+	for (size_t opcode = 0; opcode < opcode_count; ++opcode) {
+		uintptr_t key = (uintptr_t)cpufunctbl[opcode];
+		size_t slot = ((key >> 4) ^ (key >> 16)) & hash_mask;
+		size_t probes = 0;
+
+		for (;;) {
+			hash_entry *entry = &hash_tbl[slot];
+			if (entry->key == 0) {
+				if (unique_count == 0xFFFF) {
+					heap_caps_free(tmp_handlers);
+					heap_caps_free(hash_tbl);
+					heap_caps_free(index_tbl);
+					write_log("Compact dispatch: too many unique handlers (%u)\n", unique_count);
+					return false;
+				}
+				entry->key = key;
+				entry->idx = unique_count;
+				tmp_handlers[unique_count] = cpufunctbl[opcode];
+				index_tbl[opcode] = unique_count;
+				unique_count++;
+				break;
+			}
+			if (entry->key == key) {
+				index_tbl[opcode] = entry->idx;
+				break;
+			}
+			slot = (slot + 1) & hash_mask;
+			probes++;
+			if (probes >= hash_size) {
+				heap_caps_free(tmp_handlers);
+				heap_caps_free(hash_tbl);
+				heap_caps_free(index_tbl);
+				write_log("Compact dispatch: hash table overflow (%u unique handlers)\n", unique_count);
+				return false;
+			}
+		}
+	}
+
+	cpuop_func **handlers = (cpuop_func **)heap_caps_malloc(
+		(size_t)unique_count * sizeof(cpuop_func *),
+		MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+	);
+	if (handlers == NULL) {
+		heap_caps_free(tmp_handlers);
+		heap_caps_free(hash_tbl);
+		heap_caps_free(index_tbl);
+		write_log("Compact dispatch: failed to allocate %u-byte handler table in internal SRAM\n",
+		          (unsigned)(unique_count * sizeof(cpuop_func *)));
+		return false;
+	}
+	memcpy(handlers, tmp_handlers, (size_t)unique_count * sizeof(cpuop_func *));
+
+	heap_caps_free(tmp_handlers);
+	heap_caps_free(hash_tbl);
+
+	compact_dispatch_index = index_tbl;
+	compact_dispatch_handlers = handlers;
+	compact_dispatch_handler_count = unique_count;
+
+	write_log("Compact dispatch enabled: %u unique handlers, opcode index in internal SRAM\n",
+	          compact_dispatch_handler_count);
+	return true;
+#else
+	return false;
+#endif
+}
+#endif
 
 #if FLIGHT_RECORDER
 struct rec_step {
@@ -250,6 +410,25 @@ void dump_counts (void)
 
 int broken_in;
 
+#ifndef CPU_CORE_PROFILE
+#define CPU_CORE_PROFILE 0
+#endif
+
+#if CPU_CORE_PROFILE
+// Lightweight CPU hot-loop profiling counters.
+static volatile uint64_t cpu_prof_batches = 0;
+static volatile uint64_t cpu_prof_instructions = 0;
+static volatile uint64_t cpu_prof_special_breaks = 0;
+static volatile uint64_t cpu_prof_tick_checks = 0;
+static volatile uint64_t cpu_prof_special_calls = 0;
+static volatile uint64_t cpu_prof_flag_int = 0;
+static volatile uint64_t cpu_prof_flag_doint = 0;
+static volatile uint64_t cpu_prof_flag_brk = 0;
+static volatile uint64_t cpu_prof_flag_trace = 0;
+static volatile uint64_t cpu_prof_flag_stop = 0;
+static volatile uint32_t cpu_prof_last_report_ms = 0;
+#endif
+
 static __inline__ unsigned int cft_map (unsigned int f)
 {
 #ifndef HAVE_GET_WORD_UNSWAPPED
@@ -289,10 +468,10 @@ static void build_cpufunctbl (void)
 				: op_smalltbl_4_ff);
 
 	for (opcode = 0; opcode < 65536; opcode++)
-		cpufunctbl[cft_map (opcode)] = op_illg_1;
+		cpufunctbl[cft_map(opcode)] = op_illg_1;
 	for (i = 0; tbl[i].handler != NULL; i++) {
 		if (! tbl[i].specific)
-			cpufunctbl[cft_map (tbl[i].opcode)] = tbl[i].handler;
+			cpufunctbl[cft_map(tbl[i].opcode)] = tbl[i].handler;
 	}
 	for (opcode = 0; opcode < 65536; opcode++) {
 		cpuop_func *f;
@@ -301,15 +480,15 @@ static void build_cpufunctbl (void)
 			continue;
 
 		if (table68k[opcode].handler != -1) {
-			f = cpufunctbl[cft_map (table68k[opcode].handler)];
+			f = cpufunctbl[cft_map(table68k[opcode].handler)];
 			if (f == op_illg_1)
 				abort();
-			cpufunctbl[cft_map (opcode)] = f;
+			cpufunctbl[cft_map(opcode)] = f;
 		}
 	}
 	for (i = 0; tbl[i].handler != NULL; i++) {
 		if (tbl[i].specific)
-			cpufunctbl[cft_map (tbl[i].opcode)] = tbl[i].handler;
+			cpufunctbl[cft_map(tbl[i].opcode)] = tbl[i].handler;
 	}
 }
 
@@ -352,6 +531,10 @@ void init_m68k (void)
 	do_merges ();
 
 	build_cpufunctbl ();
+#if CPU_COMPACT_DISPATCH
+	// Only needed when the full 256KB table is in PSRAM.
+	build_compact_dispatch();
+#endif
 
 #if defined(ENABLE_EXCLUSIVE_SPCFLAGS) && !defined(HAVE_HARDWARE_LOCKS)
 	spcflags_lock = B2_create_mutex();
@@ -361,6 +544,9 @@ void init_m68k (void)
 
 void exit_m68k (void)
 {
+#if CPU_COMPACT_DISPATCH
+	free_compact_dispatch();
+#endif
 	fpu_exit ();
 #if defined(ENABLE_EXCLUSIVE_SPCFLAGS) && !defined(HAVE_HARDWARE_LOCKS)
 	B2_delete_mutex(spcflags_lock);
@@ -759,6 +945,7 @@ void MakeFromSR (void)
 {
 	int oldm = regs.m;
 	int olds = regs.s;
+	int oldintmask = regs.intmask;
 
 	regs.t1 = (regs.sr >> 15) & 1;
 	regs.t0 = (regs.sr >> 14) & 1;
@@ -803,7 +990,12 @@ void MakeFromSR (void)
 		}
 	}
 
-	SPCFLAGS_SET( SPCFLAG_INT );
+	// Re-check interrupt level only when IMASK changed and an external IRQ is pending.
+	// This avoids INT->DOINT churn on frequent SR updates during normal execution.
+	if (regs.intmask != oldintmask &&
+	    __atomic_load_n(&InterruptFlags, __ATOMIC_RELAXED) != 0) {
+		SPCFLAGS_SET(SPCFLAG_DOINT);
+	}
 	if (regs.t1 || regs.t0)
 		SPCFLAGS_SET( SPCFLAG_TRACE );
 	else
@@ -888,7 +1080,9 @@ static void Interrupt(int nr)
 	Exception(nr+24, 0);
 
 	regs.intmask = nr;
-	SPCFLAGS_SET( SPCFLAG_INT );
+	// On the ESP32 port, repeatedly re-arming SPCFLAG_INT here causes heavy
+	// INT/DOINT churn in the hot loop while level-1 IRQ handlers are running.
+	// External IRQ sources explicitly retrigger via TriggerInterrupt().
 }
 
 static int caar, cacr, tc, itt0, itt1, dtt0, dtt1, mmusr, urp, srp;
@@ -1450,9 +1644,9 @@ int m68k_do_specialties (void)
 // for ticks and special flags. This reduces overhead significantly.
 // The BATCH_SIZE controls how many instructions run before checking - higher
 // values improve performance but reduce interrupt responsiveness.
-// 32 instructions = good balance of performance vs responsiveness
-// Higher values (64, 128) give diminishing returns but less responsive interrupts
-#define EXEC_BATCH_SIZE 32
+// 1024 instructions amortizes loop bookkeeping while keeping responsiveness.
+// checking SPCFLAGS on every instruction.
+#define EXEC_BATCH_SIZE 4096
 
 // External tick counter (defined in main_esp32.cpp via newcpu.h)
 extern int32 emulated_ticks;
@@ -1464,40 +1658,238 @@ IRAM_ATTR
 void m68k_do_execute (void)
 {
 	for (;;) {
-		// Execute a batch of instructions before checking ticks/flags
-		// This reduces the overhead of the tick check from every instruction
-		// to every EXEC_BATCH_SIZE instructions
+		// Execute a batch of instructions before checking ticks/flags.
 		int batch_count = EXEC_BATCH_SIZE;
 		int instructions_executed = 0;
-		
-		do {
-			uae_u32 opcode = GET_OPCODE;
-#if FLIGHT_RECORDER
-			m68k_record_step(m68k_getpc());
+		bool special_hit = false;
+
+		// Keep local copies of dispatch structures in this hot loop.
+		cpuop_func **const tbl = cpufunctbl;
+#if CPU_COMPACT_DISPATCH
+		uae_u16 *const compact_idx = compact_dispatch_index;
+		cpuop_func **const compact_handlers = compact_dispatch_handlers;
 #endif
-			(*cpufunctbl[opcode])(opcode);
-			instructions_executed++;
-			
-			// Early exit if special flags are set (interrupts, etc.)
-			// This check is very fast (single memory read + compare)
-			if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
-				break;
+
+#if CPU_COMPACT_DISPATCH
+		if (unlikely(compact_idx != NULL && compact_handlers != NULL)) {
+			while (batch_count >= 4) {
+				uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+				instructions_executed++;
+				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+					batch_count -= 1;
+					special_hit = true;
+					break;
+				}
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+				instructions_executed++;
+				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+					batch_count -= 2;
+					special_hit = true;
+					break;
+				}
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+				instructions_executed++;
+				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+					batch_count -= 3;
+					special_hit = true;
+					break;
+				}
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+				instructions_executed++;
+				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+					batch_count -= 4;
+					special_hit = true;
+					break;
+				}
+
+				batch_count -= 4;
 			}
-		} while (--batch_count > 0);
+
+			while (!special_hit && batch_count-- > 0) {
+				uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*compact_handlers[compact_idx[opcode]])(opcode);
+				instructions_executed++;
+				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+					break;
+				}
+			}
+		} else
+#endif
+		{
+			// 4-way manual unroll reduces loop control overhead while preserving
+			// per-instruction SPCFLAG checks for correctness.
+			while (batch_count >= 4) {
+				uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+				instructions_executed++;
+				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+					batch_count -= 1;
+					special_hit = true;
+					break;
+				}
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+				instructions_executed++;
+				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+					batch_count -= 2;
+					special_hit = true;
+					break;
+				}
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+				instructions_executed++;
+				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+					batch_count -= 3;
+					special_hit = true;
+					break;
+				}
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+				instructions_executed++;
+				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+					batch_count -= 4;
+					special_hit = true;
+					break;
+				}
+
+				batch_count -= 4;
+			}
+
+			while (!special_hit && batch_count-- > 0) {
+				uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+				instructions_executed++;
+				if (unlikely(SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN))) {
+					break;
+				}
+			}
+		}
+
+#if CPU_CORE_PROFILE
+		cpu_prof_batches++;
+		cpu_prof_instructions += instructions_executed;
+		if (special_hit) {
+			cpu_prof_special_breaks++;
+			spcflags_t flags = __atomic_load_n(&regs.spcflags, __ATOMIC_RELAXED);
+			if (flags & SPCFLAG_INT) cpu_prof_flag_int++;
+			if (flags & SPCFLAG_DOINT) cpu_prof_flag_doint++;
+			if (flags & SPCFLAG_BRK) cpu_prof_flag_brk++;
+			if (flags & (SPCFLAG_TRACE | SPCFLAG_DOTRACE)) cpu_prof_flag_trace++;
+			if (flags & SPCFLAG_STOP) cpu_prof_flag_stop++;
+		}
+#endif
 		
 		// Decrement tick counter by number of instructions actually executed
 		// This maintains accurate instruction counting for IPS monitoring
 		emulated_ticks -= instructions_executed;
 		if (emulated_ticks <= 0) {
+#if CPU_CORE_PROFILE
+			cpu_prof_tick_checks++;
+#endif
 			cpu_do_check_ticks();
 		}
 		
 		// Handle special conditions (interrupts, trace, etc.)
 		if (SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN)) {
+#if CPU_CORE_PROFILE
+			cpu_prof_special_calls++;
+#endif
 			if (m68k_do_specialties())
 				return;
 		}
 	}
+}
+
+void reportCPUCorePerf(uint32 current_time_ms)
+{
+#if !CPU_CORE_PROFILE
+	UNUSED(current_time_ms);
+	return;
+#else
+	const uint32 interval_ms = 5000;
+	if (current_time_ms - cpu_prof_last_report_ms < interval_ms) {
+		return;
+	}
+	cpu_prof_last_report_ms = current_time_ms;
+
+	uint64_t batches = cpu_prof_batches;
+	uint64_t instructions = cpu_prof_instructions;
+	uint64_t special_breaks = cpu_prof_special_breaks;
+	uint64_t tick_checks = cpu_prof_tick_checks;
+	uint64_t special_calls = cpu_prof_special_calls;
+	uint64_t flag_int = cpu_prof_flag_int;
+	uint64_t flag_doint = cpu_prof_flag_doint;
+	uint64_t flag_brk = cpu_prof_flag_brk;
+	uint64_t flag_trace = cpu_prof_flag_trace;
+	uint64_t flag_stop = cpu_prof_flag_stop;
+
+	if (batches > 0) {
+#ifdef ARDUINO
+		Serial.printf("[CPU PERF] batches=%llu avg_instr_per_batch=%.1f special_breaks=%llu tick_checks=%llu specialties=%llu flags(INT=%llu DOINT=%llu BRK=%llu TRACE=%llu STOP=%llu)\n",
+		              batches,
+		              (double)instructions / (double)batches,
+		              special_breaks,
+		              tick_checks,
+		              special_calls,
+		              flag_int,
+		              flag_doint,
+		              flag_brk,
+		              flag_trace,
+		              flag_stop);
+#endif
+	}
+
+	cpu_prof_batches = 0;
+	cpu_prof_instructions = 0;
+	cpu_prof_special_breaks = 0;
+	cpu_prof_tick_checks = 0;
+	cpu_prof_special_calls = 0;
+	cpu_prof_flag_int = 0;
+	cpu_prof_flag_doint = 0;
+	cpu_prof_flag_brk = 0;
+	cpu_prof_flag_trace = 0;
+	cpu_prof_flag_stop = 0;
+#endif
 }
 
 void m68k_execute (void)
@@ -1524,7 +1916,7 @@ static void m68k_verify (uaecptr addr, uaecptr *nextpc)
 	last_op_for_exception_3 = opcode;
 	m68kpc_offset = 2;
 
-	if (cpufunctbl[cft_map (opcode)] == op_illg_1) {
+	if (cpufunctbl[cft_map(opcode)] == op_illg_1) {
 		opcode = 0x4AFC;
 	}
 	dp = table68k + opcode;
@@ -1559,7 +1951,7 @@ void m68k_disasm (uaecptr addr, uaecptr *nextpc, int cnt)
 		}
 		opcode = get_iword_1 (m68kpc_offset);
 		m68kpc_offset += 2;
-		if (cpufunctbl[cft_map (opcode)] == op_illg_1) {
+		if (cpufunctbl[cft_map(opcode)] == op_illg_1) {
 			opcode = 0x4AFC;
 		}
 		dp = table68k + opcode;

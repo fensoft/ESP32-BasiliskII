@@ -19,6 +19,7 @@
 #define SD_SPI_MISO  39
 #define SD_SPI_CS    42
 
+
 // Forward declarations for BasiliskII functions
 extern void basilisk_setup(void);
 extern void basilisk_loop(void);
@@ -108,7 +109,7 @@ void setup() {
     // Initialize serial
     Serial.begin(115200);
     delay(500);
-    
+
     Serial.println("\n\n========================================");
     Serial.println("  BasiliskII ESP32 - Macintosh Emulator");
     Serial.println("  M5Stack Tab5 Edition");

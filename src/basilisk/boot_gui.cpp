@@ -39,6 +39,15 @@
 #define WIFI_SDIO_D3   GPIO_NUM_8
 #define WIFI_SDIO_RST  GPIO_NUM_15
 
+// Balanced defaults: auto-connect and keep WiFi for emulator networking.
+#ifndef BOOTGUI_ENABLE_WIFI_AUTOCONNECT
+#define BOOTGUI_ENABLE_WIFI_AUTOCONNECT 1
+#endif
+
+#ifndef BOOTGUI_KEEP_WIFI_FOR_EMULATOR
+#define BOOTGUI_KEEP_WIFI_FOR_EMULATOR 1
+#endif
+
 // ============================================================================
 // Touch Task Infrastructure
 // ============================================================================
@@ -1247,7 +1256,7 @@ static void runCountdownScreen(void)
     
     // Start WiFi auto-connect if configured
     // Supports both open (no password) and encrypted networks
-    if (wifi_auto_connect && strlen(wifi_ssid) > 0) {
+    if (BOOTGUI_ENABLE_WIFI_AUTOCONNECT && wifi_auto_connect && strlen(wifi_ssid) > 0) {
         Serial.printf("[BOOT_GUI] Auto-connecting to WiFi: %s\n", wifi_ssid);
         initWiFi();
         if (strlen(wifi_password) > 0) {
@@ -1257,6 +1266,8 @@ static void runCountdownScreen(void)
         }
         wifi_connecting = true;
         wifi_connect_start = millis();
+    } else if (wifi_auto_connect && strlen(wifi_ssid) > 0) {
+        Serial.println("[BOOT_GUI] WiFi auto-connect disabled by build flag");
     }
     
     TouchEvent touch;
@@ -2453,12 +2464,12 @@ void BootGUI_Run(void)
         // Stop the touch task before returning to emulator
         stopTouchTask();
         
-        // Clean up WiFi if it was initialized but not connected
+        // Clean up WiFi unless we explicitly keep it for emulator networking.
         if (wifi_initialized) {
             WiFi.scanDelete();
             wl_status_t status = WiFi.status();
-            if (status != WL_CONNECTED) {
-                Serial.println("[BOOT_GUI] Disconnecting WiFi (not connected)...");
+            if (status != WL_CONNECTED || !BOOTGUI_KEEP_WIFI_FOR_EMULATOR) {
+                Serial.println("[BOOT_GUI] Disconnecting WiFi before emulator start...");
                 WiFi.disconnect(true);
                 WiFi.mode(WIFI_OFF);
                 delay(100);
@@ -2476,15 +2487,15 @@ void BootGUI_Run(void)
     // Stop the touch task before returning to emulator (emulator has its own input task)
     stopTouchTask();
     
-    // Clean up WiFi if it was initialized but not connected
-    // This prevents any lingering WiFi state from interfering with the emulator
+    // Clean up WiFi unless we explicitly keep it for emulator networking.
+    // This prevents any lingering WiFi state from consuming runtime resources.
     if (wifi_initialized) {
         // Cancel any in-progress scan
         WiFi.scanDelete();
         
         wl_status_t status = WiFi.status();
-        if (status != WL_CONNECTED) {
-            Serial.println("[BOOT_GUI] Disconnecting WiFi (not connected)...");
+        if (status != WL_CONNECTED || !BOOTGUI_KEEP_WIFI_FOR_EMULATOR) {
+            Serial.println("[BOOT_GUI] Disconnecting WiFi before emulator start...");
             WiFi.disconnect(true);  // Disconnect and turn off WiFi
             WiFi.mode(WIFI_OFF);
             delay(100);  // Give WiFi time to clean up
