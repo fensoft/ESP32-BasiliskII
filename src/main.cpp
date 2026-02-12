@@ -70,21 +70,15 @@ bool initSDCard() {
     // Initialize SPI with Tab5 SD card pins
     SPI.begin(SD_SPI_SCK, SD_SPI_MISO, SD_SPI_MOSI, SD_SPI_CS);
     
-    // Try fast SPI first, then fall back to a conservative speed for compatibility.
-    constexpr uint32_t kSdSpiFastHz = 40000000;
-    constexpr uint32_t kSdSpiSafeHz = 25000000;
-    uint32_t active_spi_hz = kSdSpiFastHz;
-    if (!SD.begin(SD_SPI_CS, SPI, kSdSpiFastHz)) {
-        Serial.printf("[MAIN] SD init at %u Hz failed, retrying at %u Hz\n", kSdSpiFastHz, kSdSpiSafeHz);
-        active_spi_hz = kSdSpiSafeHz;
-        if (!SD.begin(SD_SPI_CS, SPI, kSdSpiSafeHz)) {
-            Serial.println("[MAIN] ERROR: SD card initialization failed!");
-            Serial.println("[MAIN] Make sure SD card is inserted and formatted as FAT32");
-            return false;
-        }
+    // Use a conservative clock for stable sustained throughput across cards.
+    constexpr uint32_t kSdSpiHz = 25000000;
+    if (!SD.begin(SD_SPI_CS, SPI, kSdSpiHz)) {
+        Serial.println("[MAIN] ERROR: SD card initialization failed!");
+        Serial.println("[MAIN] Make sure SD card is inserted and formatted as FAT32");
+        return false;
     }
 
-    Serial.printf("[MAIN] SD SPI clock: %u Hz\n", active_spi_hz);
+    Serial.printf("[MAIN] SD SPI clock: %u Hz\n", kSdSpiHz);
     
     uint64_t cardSize = SD.cardSize() / (1024 * 1024);
     Serial.printf("[MAIN] SD card initialized: %lluMB\n", cardSize);

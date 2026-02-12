@@ -53,7 +53,9 @@ enum {
 	SPCFLAG_ALL_BUT_EXEC_RETURN	= SPCFLAG_ALL & ~SPCFLAG_JIT_EXEC_RETURN
 };
 
-#define SPCFLAG_URGENT_MASK (SPCFLAG_STOP | SPCFLAG_BRK | SPCFLAG_TRACE | SPCFLAG_DOTRACE | SPCFLAG_JIT_END_COMPILE)
+// Flags that should break the inner dispatch loop quickly on ESP32.
+// Include DOINT so interrupt-driven I/O completion is serviced with low latency.
+#define SPCFLAG_URGENT_MASK (SPCFLAG_STOP | SPCFLAG_BRK | SPCFLAG_TRACE | SPCFLAG_DOTRACE | SPCFLAG_DOINT | SPCFLAG_JIT_END_COMPILE)
 
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
 /* Hot-path read in the CPU loop.
@@ -67,9 +69,16 @@ enum {
 #endif
 
 /* Macro only used in m68k_reset() */
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+#define SPCFLAGS_INIT(m) do { \
+	regs.spcflags = (m); \
+	spcflags_urgent = ((m) & SPCFLAG_URGENT_MASK); \
+} while (0)
+#else
 #define SPCFLAGS_INIT(m) do { \
 	regs.spcflags = (m); \
 } while (0)
+#endif
 
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
 

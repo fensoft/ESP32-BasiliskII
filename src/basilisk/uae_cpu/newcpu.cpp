@@ -135,7 +135,7 @@ bool cpufunctbl_in_spiram = false;
 #endif
 
 #ifndef CPU_DEFER_DOINT_IN_BATCH
-#define CPU_DEFER_DOINT_IN_BATCH 1
+#define CPU_DEFER_DOINT_IN_BATCH 0
 #endif
 
 #if CPU_COMPACT_DISPATCH
