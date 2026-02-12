@@ -324,7 +324,7 @@ static bool wifi_auto_connect = false;
 static bool wifi_initialized = false;
 
 // Audio settings
-static bool audio_enabled = false;  // Default: audio disabled (buggy)
+static bool audio_enabled = true;  // Default: audio enabled
 
 static const char* SETTINGS_FILE = "/basilisk_settings.txt";
 
@@ -428,7 +428,7 @@ static void loadSettings(void)
         } else if (key == "wifi_auto") {
             wifi_auto_connect = (value == "yes" || value == "true" || value == "1");
             Serial.printf("[BOOT_GUI] Loaded wifi_auto: %s\n", wifi_auto_connect ? "yes" : "no");
-        } else if (key == "audio_enabled") {
+        } else if (key == "audio" || key == "audio_enabled") {
             audio_enabled = (value == "yes" || value == "true" || value == "1");
             Serial.printf("[BOOT_GUI] Loaded audio_enabled: %s\n", audio_enabled ? "yes" : "no");
         }
@@ -440,7 +440,12 @@ static void loadSettings(void)
 static void saveSettings(void)
 {
     Serial.println("[BOOT_GUI] Saving settings...");
-    
+
+    // Rewrite file from scratch to avoid stale duplicate keys across boots.
+    if (SD.exists(SETTINGS_FILE)) {
+        SD.remove(SETTINGS_FILE);
+    }
+
     File file = SD.open(SETTINGS_FILE, FILE_WRITE);
     if (!file) {
         Serial.println("[BOOT_GUI] ERROR: Cannot open settings file for writing");
@@ -458,7 +463,7 @@ static void saveSettings(void)
     file.printf("wifi_auto=%s\n", wifi_auto_connect ? "yes" : "no");
     
     // Save audio settings
-    file.printf("audio_enabled=%s\n", audio_enabled ? "yes" : "no");
+    file.printf("audio=%s\n", audio_enabled ? "yes" : "no");
     
     file.close();
     Serial.println("[BOOT_GUI] Settings saved");
@@ -1791,7 +1796,7 @@ static void runSettingsScreen(void)
             drawRadioButton(radio_start_x + radio_gap * 3, ram_y, "16 MB", selected_ram_mb == 16);
             
             // Draw Audio checkbox
-            drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio (Buggy)", audio_enabled);
+            drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio", audio_enabled);
             
             // Draw buttons
             drawButton(wifi_btn_x, wifi_btn_y, wifi_btn_w, wifi_btn_h, "WiFi", wifi_pressed);
@@ -1821,7 +1826,7 @@ static void runSettingsScreen(void)
             if (audio_changed) {
                 // Clear and redraw audio checkbox region
                 gfx.fillRect(audio_region_x, audio_region_y, audio_region_w, audio_region_h, MAC_LIGHT_GRAY);
-                drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio (Buggy)", audio_enabled);
+                drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio", audio_enabled);
             }
             
             if (boot_btn_changed) {

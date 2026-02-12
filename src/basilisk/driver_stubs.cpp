@@ -193,23 +193,28 @@ int timer_cmp_time(uint64 a, uint64 b) {
     return 0;
 }
 
-// Convert Mac time to host time (microseconds)
+// Convert Mac time to host time (microseconds).
+// Time Manager encoding:
+//   mactime > 0 : milliseconds
+//   mactime < 0 : negative microseconds
 void timer_mac2host_time(uint64 &res, int32 mactime) {
     if (mactime > 0) {
-        // Positive: already in microseconds
-        res = (uint64)mactime;
+        // Positive values are milliseconds.
+        res = (uint64)mactime * 1000ULL;
     } else {
-        // Negative: milliseconds (negate to get positive)
-        res = (uint64)(-mactime) * 1000;
+        // Negative values encode microseconds (with inverted sign).
+        res = (uint64)(-mactime);
     }
 }
 
-// Convert host time to Mac time
+// Convert host time (microseconds) to Time Manager encoding:
+//   return > 0 for milliseconds when value exceeds 31-bit microsecond range
+//   return < 0 for microseconds otherwise
 int32 timer_host2mac_time(uint64 hosttime) {
-    if (hosttime < 0x7fffffff) {
-        return (int32)hosttime;  // Microseconds
+    if (hosttime > 0x7fffffffULL) {
+        return (int32)(hosttime / 1000ULL);  // Milliseconds
     } else {
-        return (int32)(-(hosttime / 1000));  // Milliseconds (negative)
+        return -(int32)hosttime;             // Negative microseconds
     }
 }
 

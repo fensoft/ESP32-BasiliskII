@@ -60,8 +60,10 @@ void LoadPrefs(const char *vmdir)
         Serial.println("[PREFS] Disk: /Macintosh8.dsk (default, read-write)");
     }
     
-    // Enable sound output via ES8388 codec
-    PrefsReplaceBool("nosound", false);
+    // Audio toggle comes from preboot settings
+    const bool audio_enabled = BootGUI_GetAudioEnabled();
+    PrefsReplaceBool("nosound", !audio_enabled);
+    Serial.printf("[PREFS] Audio: %s\n", audio_enabled ? "enabled" : "disabled");
     
     // Get CD-ROM path from Boot GUI selection
     const char* cdrom_path = BootGUI_GetCDROMPath();

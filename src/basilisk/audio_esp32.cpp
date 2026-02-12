@@ -7,7 +7,7 @@
  *  Audio data is retrieved from the Mac OS Apple Mixer via 68k code execution,
  *  then converted from big-endian to little-endian and sent to the speaker.
  *
- *  Audio task runs on Core 0 alongside video/input tasks.
+ *  Audio task runs on the non-emulation core.
  */
 
 #include "sysdeps.h"
@@ -33,7 +33,21 @@
 // Audio task configuration
 #define AUDIO_TASK_STACK_SIZE  4096
 #define AUDIO_TASK_PRIORITY    2  // Slightly higher priority than video/input
-#define AUDIO_TASK_CORE        0  // Run on Core 0, leaving Core 1 for CPU emulation
+
+// Pin audio work to the opposite core from Arduino/emulation loop work.
+#if defined(CONFIG_ARDUINO_RUNNING_CORE)
+#define EMULATION_TASK_CORE CONFIG_ARDUINO_RUNNING_CORE
+#elif defined(ARDUINO_RUNNING_CORE)
+#define EMULATION_TASK_CORE ARDUINO_RUNNING_CORE
+#else
+#define EMULATION_TASK_CORE 1
+#endif
+
+#if defined(portNUM_PROCESSORS) && (portNUM_PROCESSORS > 1)
+#define AUDIO_TASK_CORE ((EMULATION_TASK_CORE == 0) ? 1 : 0)
+#else
+#define AUDIO_TASK_CORE EMULATION_TASK_CORE
+#endif
 
 // Audio buffer configuration
 // Using 22050 Hz for better ESP32 performance (lower CPU load)
@@ -166,39 +180,39 @@ static void stop_speaker(void)
 }
 
 /*
- *  Convert big-endian Mac audio data to little-endian ESP32 format
- *  Volume is handled by M5Unified Speaker, not here
- */
-static void convert_audio_data(const uint8_t *src, int16_t *dst, int sample_count)
-{
-    // Mac audio is big-endian, ESP32 is little-endian
-    // Just byte-swap, let M5Unified handle volume
-    
-    for (int i = 0; i < sample_count; i++) {
-        // Read big-endian 16-bit sample and convert to little-endian
-        dst[i] = (int16_t)((src[i * 2] << 8) | src[i * 2 + 1]);
-    }
-}
-
-/*
- *  Audio streaming task - runs on Core 0
+ *  Audio streaming task - runs on non-emulation core
  *  Periodically requests audio data from Mac OS and sends to speaker
  */
 static void audioTask(void *param)
 {
     (void)param;
-    Serial.println("[AUDIO] Audio task started on Core 0");
-    
-    // Wait interval based on buffer size and sample rate
-    // buffer_frames / sample_rate * 1000 = milliseconds per buffer
-    const uint32_t buffer_ms = (AUDIO_BUFFER_FRAMES * 1000) / AUDIO_SAMPLE_RATE;
-    const TickType_t task_interval = pdMS_TO_TICKS(buffer_ms > 0 ? buffer_ms : 20);
-    
-    Serial.printf("[AUDIO] Buffer interval: %u ms\n", buffer_ms);
+    Serial.printf("[AUDIO] Audio task started on Core %d\n", xPortGetCoreID());
+
+    // Poll quickly, but only request new mixer data when the speaker queue has room.
+    const TickType_t active_poll_interval = pdMS_TO_TICKS(2);
+    const TickType_t idle_poll_interval = pdMS_TO_TICKS(20);
     
     while (audio_task_running) {
         // Check if there are active sound sources
-        if (AudioStatus.num_sources > 0 && audio_open) {
+        if (AudioStatus.num_sources > 0 &&
+            audio_open &&
+            audio_irq_done_sem != NULL &&
+            speaker_initialized &&
+            !main_mute &&
+            !speaker_mute) {
+
+            // Only fetch when channel 0 has fully drained current buffer.
+            // This better matches pull-based backends that request one block
+            // at a time at playback cadence.
+            if (M5.Speaker.isPlaying(0) != 0) {
+                vTaskDelay(active_poll_interval);
+                continue;
+            }
+
+            // Drop any stale completion signal before issuing a fresh request.
+            while (xSemaphoreTake(audio_irq_done_sem, 0) == pdTRUE) {
+            }
+
             // Trigger audio interrupt to get new buffer from Mac OS
             D(bug("[AUDIO] Triggering audio interrupt\n"));
             SetInterruptFlag(INTFLAG_AUDIO);
@@ -208,56 +222,75 @@ static void audioTask(void *param)
             if (xSemaphoreTake(audio_irq_done_sem, pdMS_TO_TICKS(100)) == pdTRUE) {
                 // Get stream info from Apple Mixer
                 uint32_t apple_stream_info = ReadMacInt32(audio_data + adatStreamInfo);
-                
-                if (apple_stream_info && !main_mute && !speaker_mute && speaker_initialized) {
-                    // Calculate work size
-                    uint32_t sample_count = ReadMacInt32(apple_stream_info + scd_sampleCount);
-                    uint32_t src_channels = ReadMacInt16(apple_stream_info + scd_numChannels);
-                    uint32_t src_sample_size = ReadMacInt16(apple_stream_info + scd_sampleSize);
-                    
-                    int work_size = sample_count * (src_sample_size >> 3) * src_channels;
-                    
+                // Consume this stream-info slot exactly once.
+                WriteMacInt32(audio_data + adatStreamInfo, 0);
+
+                if (apple_stream_info && audio_mix_buf != NULL) {
+                    const uint32_t sample_count = ReadMacInt32(apple_stream_info + scd_sampleCount);
+                    const uint32_t src_channels = ReadMacInt16(apple_stream_info + scd_numChannels);
+                    const uint32_t src_sample_size = ReadMacInt16(apple_stream_info + scd_sampleSize);
+                    const uint32_t src_buffer_mac = ReadMacInt32(apple_stream_info + scd_buffer);
+                    const uint32_t src_rate_fixed = ReadMacInt32(apple_stream_info + scd_sampleRate);
+                    uint32_t src_rate_hz = src_rate_fixed >> 16;
+                    if (src_rate_hz == 0 || src_rate_hz > 96000) {
+                        src_rate_hz = AUDIO_SAMPLE_RATE;
+                    }
+
                     D(bug("[AUDIO] Got %d samples, %d channels, %d bits\n",
                           sample_count, src_channels, src_sample_size));
-                    
-                    if (work_size > 0 && work_size <= AUDIO_BUFFER_SIZE) {
+
+                    bool format_ok = true;
+                    if (sample_count == 0 || sample_count > AUDIO_BUFFER_FRAMES) {
+                        D(bug("[AUDIO] Dropping block: unsupported sample_count=%d\n", sample_count));
+                        format_ok = false;
+                    }
+                    if ((src_channels != 1 && src_channels != 2) ||
+                        (src_sample_size != 8 && src_sample_size != 16)) {
+                        D(bug("[AUDIO] Dropping block: unsupported format %dch/%dbit\n",
+                              src_channels, src_sample_size));
+                        format_ok = false;
+                    }
+
+                    if (format_ok) {
                         // Get source buffer pointer
-                        uint8_t *src = Mac2HostAddr(ReadMacInt32(apple_stream_info + scd_buffer));
-                        
-                        if (src != NULL && audio_mix_buf != NULL) {
-                            // Handle mono to stereo expansion if needed
-                            bool need_expand = (AUDIO_CHANNELS == 2 && src_channels == 1);
-                            
-                            if (need_expand && src_sample_size == 8) {
-                                // Expand 8-bit mono to 16-bit stereo
-                                // Volume is handled by M5Unified Speaker
-                                for (int i = 0; i < (int)sample_count; i++) {
-                                    // Convert unsigned 8-bit to signed 16-bit
-                                    int16_t sample = ((int16_t)src[i] - 128) << 8;
-                                    audio_mix_buf[i * 2] = sample;      // Left
-                                    audio_mix_buf[i * 2 + 1] = sample;  // Right
-                                }
-                                
-                                // Send to speaker
-                                M5.Speaker.playRaw(audio_mix_buf, sample_count * 2, AUDIO_SAMPLE_RATE, true, 1, 0, false);
-                            } else if (src_sample_size == 16) {
-                                // Convert 16-bit big-endian to little-endian
-                                // Volume is handled by M5Unified Speaker
-                                int total_samples = sample_count * src_channels;
-                                convert_audio_data(src, audio_mix_buf, total_samples);
-                                
-                                // Expand mono to stereo if needed
-                                if (need_expand) {
-                                    // In-place expansion (work backwards to avoid overwrite)
-                                    for (int i = sample_count - 1; i >= 0; i--) {
-                                        audio_mix_buf[i * 2] = audio_mix_buf[i];
-                                        audio_mix_buf[i * 2 + 1] = audio_mix_buf[i];
+                        const uint8_t *src = Mac2HostAddr(src_buffer_mac);
+                        if (src != NULL) {
+                            const int out_samples = static_cast<int>(sample_count) * AUDIO_CHANNELS;
+                            if ((out_samples * static_cast<int>(sizeof(int16_t))) <= AUDIO_BUFFER_SIZE) {
+                                if (src_sample_size == 8) {
+                                    if (src_channels == 1) {
+                                        for (uint32_t i = 0; i < sample_count; ++i) {
+                                            const int16_t sample = (static_cast<int16_t>(src[i]) - 128) << 8;
+                                            audio_mix_buf[i * 2] = sample;
+                                            audio_mix_buf[i * 2 + 1] = sample;
+                                        }
+                                    } else {
+                                        for (int i = 0; i < out_samples; ++i) {
+                                            audio_mix_buf[i] = (static_cast<int16_t>(src[i]) - 128) << 8;
+                                        }
                                     }
-                                    total_samples = sample_count * 2;
+                                } else {
+                                    if (src_channels == 1) {
+                                        for (uint32_t i = 0; i < sample_count; ++i) {
+                                            const int src_index = static_cast<int>(i) * 2;
+                                            const int16_t sample = static_cast<int16_t>(
+                                                (static_cast<uint16_t>(src[src_index]) << 8) | src[src_index + 1]);
+                                            audio_mix_buf[i * 2] = sample;
+                                            audio_mix_buf[i * 2 + 1] = sample;
+                                        }
+                                    } else {
+                                        for (int i = 0; i < out_samples; ++i) {
+                                            const int src_index = i * 2;
+                                            audio_mix_buf[i] = static_cast<int16_t>(
+                                                (static_cast<uint16_t>(src[src_index]) << 8) | src[src_index + 1]);
+                                        }
+                                    }
                                 }
-                                
-                                // Send to speaker
-                                M5.Speaker.playRaw(audio_mix_buf, total_samples, AUDIO_SAMPLE_RATE, true, 1, 0, false);
+
+                                // Stream to speaker. M5 handles I2S buffering internally.
+                                M5.Speaker.playRaw(audio_mix_buf, out_samples, src_rate_hz, true, 1, 0, false);
+                            } else {
+                                D(bug("[AUDIO] Dropping block: output size too large (%d samples)\n", out_samples));
                             }
                         }
                     }
@@ -267,8 +300,7 @@ static void audioTask(void *param)
             }
         }
         
-        // Wait until next buffer interval
-        vTaskDelay(task_interval);
+        vTaskDelay((AudioStatus.num_sources > 0) ? active_poll_interval : idle_poll_interval);
     }
     
     Serial.println("[AUDIO] Audio task exiting");
@@ -280,25 +312,16 @@ static void audioTask(void *param)
  */
 static bool open_audio(void)
 {
-    // Initialize supported formats if not already done
-    if (audio_sample_sizes.empty()) {
-        // Support 22050 Hz (recommended for ESP32) and 44100 Hz
-        audio_sample_rates.push_back(22050 << 16);
-        audio_sample_rates.push_back(44100 << 16);
-        
-        // Support 8-bit and 16-bit
-        audio_sample_sizes.push_back(8);
-        audio_sample_sizes.push_back(16);
-        
-        // Support mono and stereo
-        audio_channel_counts.push_back(1);
-        audio_channel_counts.push_back(2);
-        
-        // Default to 22050 Hz, 16-bit, stereo
-        audio_sample_rate_index = 0;  // 22050 Hz
-        audio_sample_size_index = 1;  // 16-bit
-        audio_channel_count_index = 1; // Stereo
-    }
+    // Advertise one stable output format that matches the speaker stream config.
+    audio_sample_rates.clear();
+    audio_sample_sizes.clear();
+    audio_channel_counts.clear();
+    audio_sample_rates.push_back(AUDIO_SAMPLE_RATE << 16);
+    audio_sample_sizes.push_back(AUDIO_SAMPLE_SIZE);
+    audio_channel_counts.push_back(AUDIO_CHANNELS);
+    audio_sample_rate_index = 0;
+    audio_sample_size_index = 0;
+    audio_channel_count_index = 0;
     
     // Set audio frames per block
     audio_frames_per_block = AUDIO_BUFFER_FRAMES;
@@ -379,7 +402,7 @@ void AudioInit(void)
         return;
     }
     
-    // Start audio task on Core 0
+    // Start audio task on non-emulation core
     audio_task_running = true;
     BaseType_t result = xTaskCreatePinnedToCore(
         audioTask,
@@ -398,7 +421,8 @@ void AudioInit(void)
         return;
     }
     
-    Serial.printf("[AUDIO] Audio task created on Core %d\n", AUDIO_TASK_CORE);
+    Serial.printf("[AUDIO] Audio task created on Core %d (emulation core: %d)\n",
+                  AUDIO_TASK_CORE, EMULATION_TASK_CORE);
     Serial.println("[AUDIO] Audio subsystem initialized successfully");
 }
 
@@ -463,10 +487,18 @@ void AudioInterrupt(void)
     // Get data from Apple Mixer
     if (AudioStatus.mixer) {
         M68kRegisters r;
+        // Clear previous pointer so stale buffers are never replayed.
+        WriteMacInt32(audio_data + adatStreamInfo, 0);
         r.a[0] = audio_data + adatStreamInfo;
         r.a[1] = AudioStatus.mixer;
         Execute68k(audio_data + adatGetSourceData, &r);
         D(bug("[AUDIO] GetSourceData() returns %08lx\n", r.d[0]));
+
+        // Non-zero return means the mixer did not provide fresh source data.
+        // Force stream info to 0 so callers never reuse stale buffer pointers.
+        if (r.d[0] != 0) {
+            WriteMacInt32(audio_data + adatStreamInfo, 0);
+        }
     } else {
         WriteMacInt32(audio_data + adatStreamInfo, 0);
     }

@@ -424,6 +424,8 @@ adat_error:	printf("FATAL: audio component data block initialization error\n");
 			return noErr;
 
 		case kComponentCanDoSelect:
+			if ((int16)ReadMacInt16(p) >= kDelegatedSoundComponentSelectors)
+				return 1;
 			switch ((int16)ReadMacInt16(p)) {
 				case kComponentOpenSelect:
 				case kComponentCloseSelect:
@@ -431,10 +433,12 @@ adat_error:	printf("FATAL: audio component data block initialization error\n");
 				case kComponentVersionSelect:
 				case kComponentRegisterSelect:
 				case kSoundComponentInitOutputDeviceSelect:
+				case kSoundComponentSetSourceSelect:
 				case kSoundComponentGetSourceSelect:
+				case kSoundComponentGetSourceDataSelect:
+				case kSoundComponentSetOutputSelect:
 				case kSoundComponentGetInfoSelect:
 				case kSoundComponentSetInfoSelect:
-				case kSoundComponentStartSourceSelect:
 					return 1;
 				default:
 					return 0;
@@ -479,6 +483,18 @@ adat_error:	printf("FATAL: audio component data block initialization error\n");
 			WriteMacInt32(ReadMacInt32(p), AudioStatus.mixer);
 			return noErr;
 
+		case kSoundComponentSetSourceSelect:
+			D(bug(" SetSource\n"));
+			goto delegate;
+
+		case kSoundComponentGetSourceDataSelect:
+			D(bug(" GetSourceData (selector)\n"));
+			goto delegate;
+
+		case kSoundComponentSetOutputSelect:
+			D(bug(" SetOutput\n"));
+			goto delegate;
+
 		// Sound component functions (delegated)
 		case kSoundComponentAddSourceSelect:
 			D(bug(" AddSource\n"));
@@ -488,6 +504,8 @@ adat_error:	printf("FATAL: audio component data block initialization error\n");
 		case kSoundComponentRemoveSourceSelect:
 			D(bug(" RemoveSource\n"));
 			AudioStatus.num_sources--;
+			if (AudioStatus.num_sources < 0)
+				AudioStatus.num_sources = 0;
 			goto delegate;
 
 		case kSoundComponentGetInfoSelect:
@@ -512,7 +530,7 @@ adat_error:	printf("FATAL: audio component data block initialization error\n");
 
 		case kSoundComponentPauseSourceSelect:
 			D(bug(" PauseSource\n"));
-delegate:	// Delegate call to Apple Mixer
+	delegate:	// Delegate call to Apple Mixer
 			D(bug(" delegating call to Apple Mixer\n"));
 			r.a[0] = AudioStatus.mixer;
 			r.a[1] = params;
@@ -520,15 +538,21 @@ delegate:	// Delegate call to Apple Mixer
 			D(bug(" returns %08lx\n", r.d[0]));
 			return r.d[0];
 
-		case kSoundComponentPlaySourceBufferSelect:
+		case kSoundComponentPlaySourceBufferSelect: {
 			D(bug(" PlaySourceBuffer flags %08lx\n", ReadMacInt32(p)));
-			r.d[0] = ReadMacInt32(p);
-			r.a[0] = ReadMacInt32(p + 4);
-			r.a[1] = ReadMacInt32(p + 8);
+			// Component params for this selector are:
+			// actions, sourceID, soundParamBlockPtr.
+			const uint32 psb_actions = ReadMacInt32(p);
+			const uint32 psb_source_id = ReadMacInt32(p + 4);
+			const uint32 psb_param_block = ReadMacInt32(p + 8);
+			r.d[0] = psb_actions;
+			r.a[0] = psb_source_id;
+			r.a[1] = psb_param_block;
 			r.a[2] = AudioStatus.mixer;
 			Execute68k(audio_data + adatPlaySourceBuffer, &r);
 			D(bug(" returns %08lx\n", r.d[0]));
 			return r.d[0];
+		}
 
 		default:
 			if (selector >= 0x100)
