@@ -1132,6 +1132,11 @@ bool router_write_packet(uint8 *packet, int len)
         return false;
     }
     
+    // Don't try to send packets if WiFi has dropped
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+    
     mac_hdr_t *mac = (mac_hdr_t *)packet;
     uint16 eth_type = net_ntohs(mac->type);
     
@@ -1174,6 +1179,11 @@ bool router_write_packet(uint8 *packet, int len)
 void router_poll(void)
 {
     if (!router_initialized) return;
+    
+    // Skip polling if WiFi has dropped - avoids busy-looping on dead sockets
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
     
     if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
         return;

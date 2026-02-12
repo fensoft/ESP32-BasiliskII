@@ -39,6 +39,15 @@
 #define WIFI_SDIO_D3   GPIO_NUM_8
 #define WIFI_SDIO_RST  GPIO_NUM_15
 
+// Balanced defaults: auto-connect and keep WiFi for emulator networking.
+#ifndef BOOTGUI_ENABLE_WIFI_AUTOCONNECT
+#define BOOTGUI_ENABLE_WIFI_AUTOCONNECT 1
+#endif
+
+#ifndef BOOTGUI_KEEP_WIFI_FOR_EMULATOR
+#define BOOTGUI_KEEP_WIFI_FOR_EMULATOR 1
+#endif
+
 // ============================================================================
 // Touch Task Infrastructure
 // ============================================================================
@@ -861,6 +870,10 @@ static void initWiFi(void)
     // Set WiFi mode to station
     WiFi.mode(WIFI_STA);
     
+    // Disable auto-reconnect so failed connections don't keep retrying
+    // in the background (which blocks scanning)
+    WiFi.setAutoReconnect(false);
+    
     // Disconnect from any previous connection
     WiFi.disconnect();
     
@@ -1259,12 +1272,22 @@ static void runCountdownScreen(void)
     int wifi_region_w = 600;
     int wifi_region_h = 30;
     
+    // "Skip WiFi" button - appears above main button when WiFi is connecting
+    int skip_btn_w = 300;
+    int skip_btn_h = 60;
+    int skip_btn_x = (SCREEN_WIDTH - skip_btn_w) / 2;
+    int skip_btn_y = btn_y - skip_btn_h - 20;
+    
     Serial.printf("[BOOT_GUI] Button rect: x=%d y=%d w=%d h=%d (bottom edge at %d)\n", 
                   btn_x, btn_y, btn_w, btn_h, btn_y + btn_h);
     
     bool button_pressed = false;
     bool prev_button_pressed = false;
     bool button_touch_started = false;  // Track if touch started in button
+    bool skip_pressed = false;
+    bool prev_skip_pressed = false;
+    bool skip_touch_started = false;
+    bool prev_wifi_connecting = false;  // Track when skip button appears/disappears
     bool settings_requested = false;
     bool first_frame = true;
     
@@ -1277,12 +1300,19 @@ static void runCountdownScreen(void)
     const uint32_t WIFI_TIMEOUT_MS = 10000;  // 10 second timeout
     
     // Start WiFi auto-connect if configured
-    if (wifi_auto_connect && strlen(wifi_ssid) > 0 && strlen(wifi_password) > 0) {
+    // Supports both open (no password) and encrypted networks
+    if (BOOTGUI_ENABLE_WIFI_AUTOCONNECT && wifi_auto_connect && strlen(wifi_ssid) > 0) {
         Serial.printf("[BOOT_GUI] Auto-connecting to WiFi: %s\n", wifi_ssid);
         initWiFi();
-        WiFi.begin(wifi_ssid, wifi_password);
+        if (strlen(wifi_password) > 0) {
+            WiFi.begin(wifi_ssid, wifi_password);
+        } else {
+            WiFi.begin(wifi_ssid);
+        }
         wifi_connecting = true;
         wifi_connect_start = millis();
+    } else if (wifi_auto_connect && strlen(wifi_ssid) > 0) {
+        Serial.println("[BOOT_GUI] WiFi auto-connect disabled by build flag");
     }
     
     TouchEvent touch;
@@ -1309,11 +1339,15 @@ static void runCountdownScreen(void)
                 wifi_connecting = false;
                 wifi_failed = true;
                 wifi_status_changed = true;
+                // Stop background reconnection attempts
+                WiFi.disconnect(true);
                 Serial.println("[BOOT_GUI] WiFi connection failed");
             } else if (millis() - wifi_connect_start > WIFI_TIMEOUT_MS) {
                 wifi_connecting = false;
                 wifi_failed = true;
                 wifi_status_changed = true;
+                // Stop background reconnection attempts
+                WiFi.disconnect(true);
                 Serial.println("[BOOT_GUI] WiFi connection timeout");
             }
         }
@@ -1324,6 +1358,7 @@ static void runCountdownScreen(void)
             if (touch.was_pressed) {
                 Serial.printf("[BOOT_GUI] Touch START at (%d, %d)\n", touch.x, touch.y);
                 bool in_button = isPointInRect(touch.x, touch.y, btn_x, btn_y, btn_w, btn_h);
+                bool in_skip = wifi_connecting && isPointInRect(touch.x, touch.y, skip_btn_x, skip_btn_y, skip_btn_w, skip_btn_h);
                 Serial.printf("[BOOT_GUI] In button: %s (btn_y=%d to %d)\n", 
                               in_button ? "YES" : "NO", btn_y, btn_y + btn_h);
                 
@@ -1331,6 +1366,11 @@ static void runCountdownScreen(void)
                     button_touch_started = true;
                     button_pressed = true;
                     Serial.println("[BOOT_GUI] Button touch started!");
+                }
+                if (in_skip) {
+                    skip_touch_started = true;
+                    skip_pressed = true;
+                    Serial.println("[BOOT_GUI] Skip WiFi touch started!");
                 }
             }
             
@@ -1342,19 +1382,35 @@ static void runCountdownScreen(void)
                     settings_requested = true;
                     Serial.println("[BOOT_GUI] Opening settings screen!");
                 }
+                if (skip_touch_started) {
+                    // Cancel WiFi connection and resume countdown
+                    Serial.println("[BOOT_GUI] Skipping WiFi connection");
+                    wifi_connecting = false;
+                    wifi_failed = true;
+                    WiFi.disconnect(true);
+                    WiFi.mode(WIFI_OFF);
+                    wifi_initialized = false;
+                }
                 button_touch_started = false;
                 button_pressed = false;
+                skip_touch_started = false;
+                skip_pressed = false;
             }
             
             // Update button visual state while held
             if (touch.is_pressed && button_touch_started) {
                 button_pressed = isPointInRect(touch.x, touch.y, btn_x, btn_y, btn_w, btn_h);
             }
+            if (touch.is_pressed && skip_touch_started) {
+                skip_pressed = isPointInRect(touch.x, touch.y, skip_btn_x, skip_btn_y, skip_btn_w, skip_btn_h);
+            }
         }
         
         // Check what changed
         button_changed = (button_pressed != prev_button_pressed);
         countdown_changed = (countdown != prev_countdown);
+        bool skip_btn_changed = (skip_pressed != prev_skip_pressed);
+        bool skip_btn_visibility_changed = (wifi_connecting != prev_wifi_connecting);
         
         // Only redraw what changed
         if (first_frame) {
@@ -1401,6 +1457,11 @@ static void runCountdownScreen(void)
             gfx.setTextSize(4);
             gfx.drawString(countdown_text, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 80);
             
+            // Draw "Skip WiFi" button when WiFi is connecting
+            if (wifi_connecting) {
+                drawButton(skip_btn_x, skip_btn_y, skip_btn_w, skip_btn_h, "Skip WiFi", skip_pressed);
+            }
+            
             // Draw button
             drawButton(btn_x, btn_y, btn_w, btn_h, "Change Settings", button_pressed);
             first_frame = false;
@@ -1438,7 +1499,22 @@ static void runCountdownScreen(void)
                 } else if (wifi_failed) {
                     gfx.drawString("WiFi: Connection failed", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 80);
                 }
-                
+            }
+            
+            // Show/hide "Skip WiFi" button when WiFi connecting state changes
+            if (skip_btn_visibility_changed) {
+                if (wifi_connecting) {
+                    // WiFi just started connecting - draw skip button
+                    drawButton(skip_btn_x, skip_btn_y, skip_btn_w, skip_btn_h, "Skip WiFi", skip_pressed);
+                } else {
+                    // WiFi finished - erase skip button area
+                    gfx.fillRect(skip_btn_x - 5, skip_btn_y - 5, skip_btn_w + 10, skip_btn_h + 10, MAC_LIGHT_GRAY);
+                }
+            }
+            
+            // Update skip button pressed state
+            if (skip_btn_changed && wifi_connecting) {
+                drawButton(skip_btn_x, skip_btn_y, skip_btn_w, skip_btn_h, "Skip WiFi", skip_pressed);
             }
             
             if (button_changed) {
@@ -1449,6 +1525,8 @@ static void runCountdownScreen(void)
         
         // Update state tracking
         prev_button_pressed = button_pressed;
+        prev_skip_pressed = skip_pressed;
+        prev_wifi_connecting = wifi_connecting;
         prev_countdown = countdown;
         
         // Update countdown - but pause while WiFi is connecting
@@ -1800,6 +1878,18 @@ static void runWiFiScreen(void)
     // Initialize WiFi if not already done
     initWiFi();
     
+    // Ensure WiFi is in a clean state for scanning.
+    // After a failed auto-connect attempt, the driver may still be associated.
+    // Disconnect (without erasing config) and give it time to settle.
+    wl_status_t pre_status = WiFi.status();
+    Serial.printf("[BOOT_GUI] WiFi pre-scan status: %d\n", pre_status);
+    if (pre_status != WL_IDLE_STATUS && pre_status != WL_DISCONNECTED) {
+        WiFi.disconnect(false);
+        delay(100);
+    }
+    // Delete any leftover scan results
+    WiFi.scanDelete();
+    
     // Layout constants
     int content_x = SCREEN_MARGIN;
     int content_y = SCREEN_MARGIN + TITLE_BAR_HEIGHT;
@@ -1942,7 +2032,13 @@ static void runWiFiScreen(void)
                 // Save credentials on successful connection
                 if (wifi_selection_index >= 0 && wifi_selection_index < (int)wifi_networks.size()) {
                     strncpy(wifi_ssid, wifi_networks[wifi_selection_index].ssid, sizeof(wifi_ssid) - 1);
-                    strncpy(wifi_password, password_buffer, sizeof(wifi_password) - 1);
+                    // For open networks, save empty password
+                    bool is_open = (wifi_networks[wifi_selection_index].encryption == WIFI_AUTH_OPEN);
+                    if (is_open) {
+                        wifi_password[0] = '\0';
+                    } else {
+                        strncpy(wifi_password, password_buffer, sizeof(wifi_password) - 1);
+                    }
                     wifi_auto_connect = true;
                     saveSettings();
                 }
@@ -2042,10 +2138,16 @@ static void runWiFiScreen(void)
                     }
                     
                     if (connect_touch_started && wifi_selection_index >= 0 && !connecting) {
-                        Serial.printf("[BOOT_GUI] Connecting to %s...\n", 
-                                      wifi_networks[wifi_selection_index].ssid);
+                        const char* selected_ssid = wifi_networks[wifi_selection_index].ssid;
+                        bool is_open = (wifi_networks[wifi_selection_index].encryption == WIFI_AUTH_OPEN);
+                        Serial.printf("[BOOT_GUI] Connecting to %s (%s)...\n", 
+                                      selected_ssid, is_open ? "open" : "encrypted");
                         connecting = true;
-                        WiFi.begin(wifi_networks[wifi_selection_index].ssid, password_buffer);
+                        if (is_open || strlen(password_buffer) == 0) {
+                            WiFi.begin(selected_ssid);
+                        } else {
+                            WiFi.begin(selected_ssid, password_buffer);
+                        }
                     }
                     
                     if (back_touch_started) {
@@ -2439,12 +2541,12 @@ void BootGUI_Run(void)
         // Stop the touch task before returning to emulator
         stopTouchTask();
         
-        // Clean up WiFi if it was initialized but not connected
+        // Clean up WiFi unless we explicitly keep it for emulator networking.
         if (wifi_initialized) {
             WiFi.scanDelete();
             wl_status_t status = WiFi.status();
-            if (status != WL_CONNECTED) {
-                Serial.println("[BOOT_GUI] Disconnecting WiFi (not connected)...");
+            if (status != WL_CONNECTED || !BOOTGUI_KEEP_WIFI_FOR_EMULATOR) {
+                Serial.println("[BOOT_GUI] Disconnecting WiFi before emulator start...");
                 WiFi.disconnect(true);
                 WiFi.mode(WIFI_OFF);
                 delay(100);
@@ -2462,15 +2564,15 @@ void BootGUI_Run(void)
     // Stop the touch task before returning to emulator (emulator has its own input task)
     stopTouchTask();
     
-    // Clean up WiFi if it was initialized but not connected
-    // This prevents any lingering WiFi state from interfering with the emulator
+    // Clean up WiFi unless we explicitly keep it for emulator networking.
+    // This prevents any lingering WiFi state from consuming runtime resources.
     if (wifi_initialized) {
         // Cancel any in-progress scan
         WiFi.scanDelete();
         
         wl_status_t status = WiFi.status();
-        if (status != WL_CONNECTED) {
-            Serial.println("[BOOT_GUI] Disconnecting WiFi (not connected)...");
+        if (status != WL_CONNECTED || !BOOTGUI_KEEP_WIFI_FOR_EMULATOR) {
+            Serial.println("[BOOT_GUI] Disconnecting WiFi before emulator start...");
             WiFi.disconnect(true);  // Disconnect and turn off WiFi
             WiFi.mode(WIFI_OFF);
             delay(100);  // Give WiFi time to clean up

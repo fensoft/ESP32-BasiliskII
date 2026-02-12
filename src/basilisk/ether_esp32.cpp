@@ -172,7 +172,11 @@ void ether_exit(void)
 void ether_reset(void)
 {
     D(bug("[ETHER] Reset\n"));
-    
+
+    if (!net_initialized || net_mutex == nullptr) {
+        return;
+    }
+
     if (xSemaphoreTake(net_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         protocol_handlers.clear();
         xSemaphoreGive(net_mutex);
@@ -205,6 +209,10 @@ int16 ether_attach_ph(uint16 type, uint32 handler)
 {
     D(bug("[ETHER] Attach protocol handler type=%04x handler=%08x\n", type, handler));
     
+    if (!net_initialized || net_mutex == nullptr) {
+        return lapProtErr;
+    }
+    
     if (xSemaphoreTake(net_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         return lapProtErr;
     }
@@ -228,6 +236,10 @@ int16 ether_detach_ph(uint16 type)
 {
     D(bug("[ETHER] Detach protocol handler type=%04x\n", type));
     
+    if (!net_initialized || net_mutex == nullptr) {
+        return lapProtErr;
+    }
+    
     if (xSemaphoreTake(net_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         return lapProtErr;
     }
@@ -249,6 +261,11 @@ int16 ether_write(uint32 wds)
     D(bug("[ETHER] Write packet, wds=%08x\n", wds));
     
     if (!net_initialized) {
+        return excessCollsns;
+    }
+    
+    // Gracefully handle WiFi having dropped mid-session
+    if (WiFi.status() != WL_CONNECTED) {
         return excessCollsns;
     }
     
@@ -374,19 +391,42 @@ void EtherInterrupt(void)
 static void net_rx_task(void *param)
 {
     Serial.println("[ETHER] Network RX task started");
+    uint16_t idle_polls = 0;
     
     while (net_rx_task_running) {
+        // If WiFi has dropped, sleep longer to avoid busy-looping on dead sockets
+        if (WiFi.status() != WL_CONNECTED) {
+            idle_polls = 0;
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        
         // Poll the router for incoming packets
         router_poll();
         
         // If packets are available, signal the emulator
-        if (router_has_pending_packets()) {
-            SetInterruptFlag(INTFLAG_ETHER);
-            TriggerInterrupt();
+        bool has_pending = router_has_pending_packets();
+        if (has_pending) {
+            if (SetInterruptFlagIfNew(INTFLAG_ETHER)) {
+                TriggerInterrupt();
+            }
+            idle_polls = 0;
+        } else if (idle_polls < 0xFFFF) {
+            idle_polls++;
         }
         
-        // Small delay to avoid hogging CPU
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // Adaptive backoff:
+        // - active traffic: keep low latency
+        // - idle: poll less often to reduce Core 0 load and memory bus contention
+        uint32_t delay_ms = 5;
+        if (!has_pending) {
+            if (idle_polls > 40) {
+                delay_ms = 30;
+            } else if (idle_polls > 10) {
+                delay_ms = 10;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
     
     Serial.println("[ETHER] Network RX task stopped");

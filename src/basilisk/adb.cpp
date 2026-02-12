@@ -261,8 +261,8 @@ void ADBMouseMoved(int x, int y)
 		mouse_x = x; mouse_y = y;
 	}
 	B2_unlock_mutex(mouse_lock);
-	SetInterruptFlag(INTFLAG_ADB);
-	TriggerInterrupt();
+	if (SetInterruptFlagIfNew(INTFLAG_ADB))
+		TriggerInterrupt();
 }
 
 
@@ -277,8 +277,8 @@ void ADBMouseDown(int button)
     button_write_ptr = (button_write_ptr + 1) % BUTTON_BUFFER_SIZE;
 
     // O2S: mouse_button[button] = true;
-	SetInterruptFlag(INTFLAG_ADB);
-	TriggerInterrupt();
+	if (SetInterruptFlagIfNew(INTFLAG_ADB))
+		TriggerInterrupt();
 }
 
 
@@ -293,8 +293,8 @@ void ADBMouseUp(int button)
     button_write_ptr = (button_write_ptr + 1) % BUTTON_BUFFER_SIZE;
 
     // O2S: mouse_button[button] = false;
-	SetInterruptFlag(INTFLAG_ADB);
-	TriggerInterrupt();
+	if (SetInterruptFlagIfNew(INTFLAG_ADB))
+		TriggerInterrupt();
 }
 
 
@@ -338,8 +338,8 @@ void ADBKeyDown(int code)
 	B2_unlock_mutex(key_lock);
 
 	// Trigger interrupt
-	SetInterruptFlag(INTFLAG_ADB);
-	TriggerInterrupt();
+	if (SetInterruptFlagIfNew(INTFLAG_ADB))
+		TriggerInterrupt();
 }
 
 
@@ -370,8 +370,8 @@ void ADBKeyUp(int code)
 	B2_unlock_mutex(key_lock);
 
 	// Trigger interrupt
-	SetInterruptFlag(INTFLAG_ADB);
-	TriggerInterrupt();
+	if (SetInterruptFlagIfNew(INTFLAG_ADB))
+		TriggerInterrupt();
 }
 
 

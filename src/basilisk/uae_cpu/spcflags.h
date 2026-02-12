@@ -53,31 +53,26 @@ enum {
 	SPCFLAG_ALL_BUT_EXEC_RETURN	= SPCFLAG_ALL & ~SPCFLAG_JIT_EXEC_RETURN
 };
 
-#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
-/* Local flags set by the CPU core (fast-path check) */
-#define SPCFLAGS_LOCAL_MASK (SPCFLAG_STOP | SPCFLAG_BRK | SPCFLAG_TRACE | SPCFLAG_DOTRACE | \
-	SPCFLAG_DOINT | SPCFLAG_JIT_END_COMPILE | SPCFLAG_JIT_EXEC_RETURN)
-extern volatile spcflags_t spcflags_local;
-#endif
+// Flags that should break the inner dispatch loop quickly on ESP32.
+// Include DOINT so interrupt-driven I/O completion is serviced with low latency.
+#define SPCFLAG_URGENT_MASK (SPCFLAG_STOP | SPCFLAG_BRK | SPCFLAG_TRACE | SPCFLAG_DOTRACE | SPCFLAG_DOINT | SPCFLAG_JIT_END_COMPILE)
 
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
-/* Atomic read for ESP32 dual-core safety */
+/* Hot-path read in the CPU loop.
+ * On ESP32-P4, aligned 32-bit loads are atomic; use a direct read to keep
+ * the instruction dispatch path as lean as possible. */
 #define SPCFLAGS_TEST(m) \
-	((__atomic_load_n(&regs.spcflags, __ATOMIC_SEQ_CST) & (m)) != 0)
-/* Relaxed load for hot paths where ordering isn't required (faster) */
-#define SPCFLAGS_TEST_RELAXED(m) \
-	((__atomic_load_n(&regs.spcflags, __ATOMIC_RELAXED) & (m)) != 0)
+	((regs.spcflags & (m)) != 0)
 #else
 #define SPCFLAGS_TEST(m) \
 	((regs.spcflags & (m)) != 0)
-#define SPCFLAGS_TEST_RELAXED(m) SPCFLAGS_TEST(m)
 #endif
 
 /* Macro only used in m68k_reset() */
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
 #define SPCFLAGS_INIT(m) do { \
 	regs.spcflags = (m); \
-	spcflags_local = ((m) & SPCFLAGS_LOCAL_MASK); \
+	spcflags_urgent = ((m) & SPCFLAG_URGENT_MASK); \
 } while (0)
 #else
 #define SPCFLAGS_INIT(m) do { \
@@ -86,6 +81,8 @@ extern volatile spcflags_t spcflags_local;
 #endif
 
 #if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+
+extern volatile spcflags_t spcflags_urgent;
 
 /*
  * ESP32 dual-core atomic operations using GCC builtins
@@ -94,18 +91,18 @@ extern volatile spcflags_t spcflags_local;
 #define HAVE_HARDWARE_LOCKS
 
 #define SPCFLAGS_SET(m) do { \
-	spcflags_t __m = (m); \
-	__atomic_or_fetch(&regs.spcflags, __m, __ATOMIC_SEQ_CST); \
-	if (__m & SPCFLAGS_LOCAL_MASK) { \
-		spcflags_local |= (__m & SPCFLAGS_LOCAL_MASK); \
+	const spcflags_t __m = (m); \
+	__atomic_or_fetch(&regs.spcflags, __m, __ATOMIC_RELAXED); \
+	if (__m & SPCFLAG_URGENT_MASK) { \
+		__atomic_or_fetch(&spcflags_urgent, (__m & SPCFLAG_URGENT_MASK), __ATOMIC_RELAXED); \
 	} \
 } while (0)
 
 #define SPCFLAGS_CLEAR(m) do { \
-	spcflags_t __m = (m); \
-	__atomic_and_fetch(&regs.spcflags, ~__m, __ATOMIC_SEQ_CST); \
-	if (__m & SPCFLAGS_LOCAL_MASK) { \
-		spcflags_local &= ~(__m & SPCFLAGS_LOCAL_MASK); \
+	const spcflags_t __m = (m); \
+	__atomic_and_fetch(&regs.spcflags, ~__m, __ATOMIC_RELAXED); \
+	if (__m & SPCFLAG_URGENT_MASK) { \
+		__atomic_and_fetch(&spcflags_urgent, ~(__m & SPCFLAG_URGENT_MASK), __ATOMIC_RELAXED); \
 	} \
 } while (0)
 

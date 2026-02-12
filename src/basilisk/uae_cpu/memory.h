@@ -118,6 +118,22 @@ extern uint32 RAMSize;
 extern uint32 ROMBaseMac;
 extern uint8 *ROMBaseHost;
 extern uint32 ROMSize;
+extern int MacFrameLayout;
+#if !REAL_ADDRESSING && !DIRECT_ADDRESSING
+extern uint8 *MacFrameBaseHost;
+extern uint32 MacFrameSize;
+extern void VideoMarkDirtyOffset(uint32 offset);
+extern void VideoMarkDirtyRange(uint32 offset, uint32 size);
+
+#ifndef FLAYOUT_DIRECT
+#define FLAYOUT_DIRECT 1
+#endif
+
+// Frame buffer base used by banked memory layout in Basilisk.
+#ifndef BASILISK_FRAME_BASE_MAC
+#define BASILISK_FRAME_BASE_MAC 0xA0000000u
+#endif
+#endif
 
 // Fast-path long (32-bit) read
 static inline uae_u32 longget_fastpath(uaecptr addr) {
@@ -125,6 +141,13 @@ static inline uae_u32 longget_fastpath(uaecptr addr) {
     // RAM is at address 0, so just check if addr < RAMSize
     if (likely(addr < RAMSize)) {
         uae_u32 *m = (uae_u32 *)(RAMBaseHost + addr);
+        return do_get_mem_long(m);
+    }
+    // Fast path for direct-layout frame buffer reads
+    if (MacFrameLayout == FLAYOUT_DIRECT &&
+        addr >= BASILISK_FRAME_BASE_MAC &&
+        addr < (BASILISK_FRAME_BASE_MAC + MacFrameSize)) {
+        uae_u32 *m = (uae_u32 *)(MacFrameBaseHost + (addr - BASILISK_FRAME_BASE_MAC));
         return do_get_mem_long(m);
     }
     // Fast path for ROM
@@ -142,6 +165,12 @@ static inline uae_u32 wordget_fastpath(uaecptr addr) {
         uae_u16 *m = (uae_u16 *)(RAMBaseHost + addr);
         return do_get_mem_word(m);
     }
+    if (MacFrameLayout == FLAYOUT_DIRECT &&
+        addr >= BASILISK_FRAME_BASE_MAC &&
+        addr < (BASILISK_FRAME_BASE_MAC + MacFrameSize)) {
+        uae_u16 *m = (uae_u16 *)(MacFrameBaseHost + (addr - BASILISK_FRAME_BASE_MAC));
+        return do_get_mem_word(m);
+    }
     if (addr >= ROMBaseMac && addr < ROMBaseMac + ROMSize) {
         uae_u16 *m = (uae_u16 *)(ROMBaseHost + (addr - ROMBaseMac));
         return do_get_mem_word(m);
@@ -153,6 +182,11 @@ static inline uae_u32 wordget_fastpath(uaecptr addr) {
 static inline uae_u32 byteget_fastpath(uaecptr addr) {
     if (likely(addr < RAMSize)) {
         return *(uae_u8 *)(RAMBaseHost + addr);
+    }
+    if (MacFrameLayout == FLAYOUT_DIRECT &&
+        addr >= BASILISK_FRAME_BASE_MAC &&
+        addr < (BASILISK_FRAME_BASE_MAC + MacFrameSize)) {
+        return *(uae_u8 *)(MacFrameBaseHost + (addr - BASILISK_FRAME_BASE_MAC));
     }
     if (addr >= ROMBaseMac && addr < ROMBaseMac + ROMSize) {
         return *(uae_u8 *)(ROMBaseHost + (addr - ROMBaseMac));
@@ -168,6 +202,15 @@ static inline void longput_fastpath(uaecptr addr, uae_u32 l) {
         do_put_mem_long(m, l);
         return;
     }
+    // Fast path for direct-layout frame buffer writes.
+    if (MacFrameLayout == FLAYOUT_DIRECT &&
+        addr >= BASILISK_FRAME_BASE_MAC &&
+        addr < (BASILISK_FRAME_BASE_MAC + MacFrameSize)) {
+        uae_u32 *m = (uae_u32 *)(MacFrameBaseHost + (addr - BASILISK_FRAME_BASE_MAC));
+        do_put_mem_long(m, l);
+        VideoMarkDirtyRange(addr - BASILISK_FRAME_BASE_MAC, 4);
+        return;
+    }
     // ROM writes go to bank handler (which will log/ignore them)
     // Frame buffer and hardware writes also go through bank handler
     call_mem_put_func(get_mem_bank(addr).lput, addr, l);
@@ -180,6 +223,14 @@ static inline void wordput_fastpath(uaecptr addr, uae_u32 w) {
         do_put_mem_word(m, w);
         return;
     }
+    if (MacFrameLayout == FLAYOUT_DIRECT &&
+        addr >= BASILISK_FRAME_BASE_MAC &&
+        addr < (BASILISK_FRAME_BASE_MAC + MacFrameSize)) {
+        uae_u16 *m = (uae_u16 *)(MacFrameBaseHost + (addr - BASILISK_FRAME_BASE_MAC));
+        do_put_mem_word(m, w);
+        VideoMarkDirtyRange(addr - BASILISK_FRAME_BASE_MAC, 2);
+        return;
+    }
     call_mem_put_func(get_mem_bank(addr).wput, addr, w);
 }
 
@@ -187,6 +238,13 @@ static inline void wordput_fastpath(uaecptr addr, uae_u32 w) {
 static inline void byteput_fastpath(uaecptr addr, uae_u32 b) {
     if (likely(addr < RAMSize)) {
         *(uae_u8 *)(RAMBaseHost + addr) = b;
+        return;
+    }
+    if (MacFrameLayout == FLAYOUT_DIRECT &&
+        addr >= BASILISK_FRAME_BASE_MAC &&
+        addr < (BASILISK_FRAME_BASE_MAC + MacFrameSize)) {
+        *(uae_u8 *)(MacFrameBaseHost + (addr - BASILISK_FRAME_BASE_MAC)) = b;
+        VideoMarkDirtyOffset(addr - BASILISK_FRAME_BASE_MAC);
         return;
     }
     call_mem_put_func(get_mem_bank(addr).bput, addr, b);
@@ -311,4 +369,3 @@ extern uae_u32 get_virtual_address(uae_u8 *addr);
 #endif /* DIRECT_ADDRESSING || REAL_ADDRESSING */
 
 #endif /* MEMORY_H */
-

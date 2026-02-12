@@ -53,6 +53,65 @@ extern bool tick_inhibit;
 
 void PlayStartupSound();
 
+#ifndef IRQ_SOURCE_PROFILE
+#define IRQ_SOURCE_PROFILE 0
+#endif
+
+#ifndef VBL_TASK_TRAP_DIVISOR
+#define VBL_TASK_TRAP_DIVISOR 1
+#endif
+
+#if IRQ_SOURCE_PROFILE
+static uint64_t irq_prof_calls = 0;
+static uint64_t irq_prof_nonzero = 0;
+static uint64_t irq_prof_60hz = 0;
+static uint64_t irq_prof_1hz = 0;
+static uint64_t irq_prof_serial = 0;
+static uint64_t irq_prof_ether = 0;
+static uint64_t irq_prof_audio = 0;
+static uint64_t irq_prof_timer = 0;
+static uint64_t irq_prof_adb = 0;
+static uint64_t irq_prof_nmi = 0;
+static uint32_t irq_prof_last_report_ms = 0;
+#endif
+
+void reportIRQProfile(uint32 current_time_ms)
+{
+#if !IRQ_SOURCE_PROFILE
+	UNUSED(current_time_ms);
+	return;
+#else
+	const uint32 interval_ms = 5000;
+	if (current_time_ms - irq_prof_last_report_ms < interval_ms) {
+		return;
+	}
+	irq_prof_last_report_ms = current_time_ms;
+
+	Serial.printf("[IRQ PERF] calls=%llu nonzero=%llu flags(60=%llu 1=%llu adb=%llu eth=%llu ser=%llu tmr=%llu aud=%llu nmi=%llu)\n",
+	              irq_prof_calls,
+	              irq_prof_nonzero,
+	              irq_prof_60hz,
+	              irq_prof_1hz,
+	              irq_prof_adb,
+	              irq_prof_ether,
+	              irq_prof_serial,
+	              irq_prof_timer,
+	              irq_prof_audio,
+	              irq_prof_nmi);
+
+	irq_prof_calls = 0;
+	irq_prof_nonzero = 0;
+	irq_prof_60hz = 0;
+	irq_prof_1hz = 0;
+	irq_prof_serial = 0;
+	irq_prof_ether = 0;
+	irq_prof_audio = 0;
+	irq_prof_timer = 0;
+	irq_prof_adb = 0;
+	irq_prof_nmi = 0;
+#endif
+}
+
 /*
  *  Execute EMUL_OP opcode (called by 68k emulator or Illegal Instruction trap handler)
  */
@@ -449,16 +508,51 @@ void EmulOp(uint16 opcode, M68kRegisters *r)
 			break;
 		}
 
-		case M68K_EMUL_OP_IRQ:			// Level 1 interrupt
+		case M68K_EMUL_OP_IRQ: {			// Level 1 interrupt
 			r->d[0] = 0;
+#if IRQ_SOURCE_PROFILE
+			irq_prof_calls++;
+#endif
 
-			if (InterruptFlags & INTFLAG_60HZ) {
-				ClearInterruptFlag(INTFLAG_60HZ);
+			// Snapshot and clear all pending IRQ flags in one atomic op.
+			// Any flags raised concurrently after this point stay pending.
+			uint32 irq_flags = __atomic_exchange_n(&InterruptFlags, 0, __ATOMIC_RELAXED);
+			if (irq_flags == 0) {
+				break;
+			}
+#if IRQ_SOURCE_PROFILE
+			irq_prof_nonzero++;
+			if (irq_flags & INTFLAG_60HZ) irq_prof_60hz++;
+			if (irq_flags & INTFLAG_1HZ) irq_prof_1hz++;
+			if (irq_flags & INTFLAG_SERIAL) irq_prof_serial++;
+			if (irq_flags & INTFLAG_ETHER) irq_prof_ether++;
+			if (irq_flags & INTFLAG_TIMER) irq_prof_timer++;
+			if (irq_flags & INTFLAG_AUDIO) irq_prof_audio++;
+			if (irq_flags & INTFLAG_ADB) irq_prof_adb++;
+			if (irq_flags & INTFLAG_NMI) irq_prof_nmi++;
+#endif
+
+			const bool needs_started_check =
+				(irq_flags & (INTFLAG_60HZ | INTFLAG_1HZ | INTFLAG_ADB | INTFLAG_NMI)) != 0;
+			static bool mac_started_cached = false;
+			bool mac_started = false;
+			if (needs_started_check) {
+				if (mac_started_cached) {
+					mac_started = true;
+				} else {
+					mac_started = HasMacStarted();
+					if (mac_started) {
+						mac_started_cached = true;
+					}
+				}
+			}
+
+			if (irq_flags & INTFLAG_60HZ) {
 
 				// Increment Ticks variable
 				WriteMacInt32(0x16a, ReadMacInt32(0x16a) + 1);
 
-				if (HasMacStarted()) {
+				if (mac_started) {
 
 					// Mac has started, execute all 60Hz interrupt functions
 #if !PRECISE_TIMING
@@ -468,56 +562,60 @@ void EmulOp(uint16 opcode, M68kRegisters *r)
 
 					// Call DoVBLTask(0)
 					if (ROMVersion == ROM_VERSION_32) {
+#if VBL_TASK_TRAP_DIVISOR <= 1
 						M68kRegisters r2;
 						r2.d[0] = 0;
 						Execute68kTrap(0xa072, &r2);
+#else
+						static uint8_t vbl_task_div_counter = 0;
+						if (++vbl_task_div_counter >= VBL_TASK_TRAP_DIVISOR) {
+							vbl_task_div_counter = 0;
+							M68kRegisters r2;
+							r2.d[0] = 0;
+							Execute68kTrap(0xa072, &r2);
+						}
+#endif
 					}
 
 					r->d[0] = 1;			// Flag: 68k interrupt routine executes VBLTasks etc.
 				}
 			}
 
-			if (InterruptFlags & INTFLAG_1HZ) {
-				ClearInterruptFlag(INTFLAG_1HZ);
-				if (HasMacStarted()) {
+			if (irq_flags & INTFLAG_1HZ) {
+				if (mac_started) {
 					SonyInterrupt();
 					DiskInterrupt();
 					CDROMInterrupt();
 				}
 			}
 
-			if (InterruptFlags & INTFLAG_SERIAL) {
-				ClearInterruptFlag(INTFLAG_SERIAL);
+			if (irq_flags & INTFLAG_SERIAL) {
 				SerialInterrupt();
 			}
 
-			if (InterruptFlags & INTFLAG_ETHER) {
-				ClearInterruptFlag(INTFLAG_ETHER);
+			if (irq_flags & INTFLAG_ETHER) {
 				EtherInterrupt();
 			}
 #if PRECISE_TIMING
-			if (InterruptFlags & INTFLAG_TIMER) {
-				ClearInterruptFlag(INTFLAG_TIMER);
+			if (irq_flags & INTFLAG_TIMER) {
 				TimerInterrupt();
 			}
 #endif
-			if (InterruptFlags & INTFLAG_AUDIO) {
-				ClearInterruptFlag(INTFLAG_AUDIO);
+			if (irq_flags & INTFLAG_AUDIO) {
 				AudioInterrupt();
 			}
 
-			if (InterruptFlags & INTFLAG_ADB) {
-				ClearInterruptFlag(INTFLAG_ADB);
-				if (HasMacStarted())
+			if (irq_flags & INTFLAG_ADB) {
+				if (mac_started)
 					ADBInterrupt();
 			}
 
-			if (InterruptFlags & INTFLAG_NMI) {
-				ClearInterruptFlag(INTFLAG_NMI);
-				if (HasMacStarted())
+			if (irq_flags & INTFLAG_NMI) {
+				if (mac_started)
 					TriggerNMI();
 			}
 			break;
+		}
 
 		case M68K_EMUL_OP_PUT_SCRAP: {		// PutScrap() patch
 			void *scrap = Mac2HostAddr(ReadMacInt32(r->a[7] + 4));

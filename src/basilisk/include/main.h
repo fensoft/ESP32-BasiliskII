@@ -79,6 +79,7 @@ enum {
 
 extern uint32 InterruptFlags;									// Currently pending interrupts
 extern void SetInterruptFlag(uint32 flag);						// Set/clear interrupt flags
+extern bool SetInterruptFlagIfNew(uint32 flag);					// Set flag and return true only on 0->1 transition
 extern void ClearInterruptFlag(uint32 flag);
 
 // vde switch variable

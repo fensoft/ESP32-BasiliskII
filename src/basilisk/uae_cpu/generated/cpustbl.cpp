@@ -14,7 +14,7 @@
 #ifdef NOFLAGS
 # include "noflags.h"
 #endif
-struct cputbl CPUFUNC(op_smalltbl_0)[] = {
+const struct cputbl CPUFUNC(op_smalltbl_0)[] = {
 { CPUFUNC(op_0_0), 0, 0 }, /* OR.B #<data>.B,Dn */
 { CPUFUNC(op_10_0), 0, 16 }, /* OR.B #<data>.B,(An) */
 { CPUFUNC(op_18_0), 0, 24 }, /* OR.B #<data>.B,(An)+ */
@@ -1884,7 +1884,7 @@ struct cputbl CPUFUNC(op_smalltbl_0)[] = {
 { CPUFUNC_FF(op_f618_0), 0, 63000 }, /* MOVE16.L (xxx).L,(An) */
 { CPUFUNC_FF(op_f620_0), 0, 63008 }, /* MOVE16.L (An)+,(An)+ */
 { 0, 0, 0 }};
-struct cputbl CPUFUNC(op_smalltbl_1)[] = {
+const struct cputbl CPUFUNC(op_smalltbl_1)[] = {
 { CPUFUNC(op_0_0), 0, 0 }, /* OR.B #<data>.B,Dn */
 { CPUFUNC(op_10_0), 0, 16 }, /* OR.B #<data>.B,(An) */
 { CPUFUNC(op_18_0), 0, 24 }, /* OR.B #<data>.B,(An)+ */
@@ -3728,7 +3728,7 @@ struct cputbl CPUFUNC(op_smalltbl_1)[] = {
 { CPUFUNC_FF(op_f37a_0), 0, 62330 }, /* FRESTORE.L (d16,PC) */
 { CPUFUNC_FF(op_f37b_0), 0, 62331 }, /* FRESTORE.L (d8,PC,Xn) */
 { 0, 0, 0 }};
-struct cputbl CPUFUNC(op_smalltbl_2)[] = {
+const struct cputbl CPUFUNC(op_smalltbl_2)[] = {
 { CPUFUNC(op_0_0), 0, 0 }, /* OR.B #<data>.B,Dn */
 { CPUFUNC(op_10_0), 0, 16 }, /* OR.B #<data>.B,(An) */
 { CPUFUNC(op_18_0), 0, 24 }, /* OR.B #<data>.B,(An)+ */
@@ -5532,7 +5532,7 @@ struct cputbl CPUFUNC(op_smalltbl_2)[] = {
 { CPUFUNC(op_eff8_0), 0, 61432 }, /* BFINS.L #<data>.W,(xxx).W */
 { CPUFUNC(op_eff9_0), 0, 61433 }, /* BFINS.L #<data>.W,(xxx).L */
 { 0, 0, 0 }};
-struct cputbl CPUFUNC(op_smalltbl_3)[] = {
+const struct cputbl CPUFUNC(op_smalltbl_3)[] = {
 { CPUFUNC(op_0_0), 0, 0 }, /* OR.B #<data>.B,Dn */
 { CPUFUNC(op_10_0), 0, 16 }, /* OR.B #<data>.B,(An) */
 { CPUFUNC(op_18_0), 0, 24 }, /* OR.B #<data>.B,(An)+ */
@@ -7130,7 +7130,7 @@ struct cputbl CPUFUNC(op_smalltbl_3)[] = {
 { CPUFUNC(op_e7f8_0), 0, 59384 }, /* ROLW.W (xxx).W */
 { CPUFUNC(op_e7f9_0), 0, 59385 }, /* ROLW.W (xxx).L */
 { 0, 0, 0 }};
-struct cputbl CPUFUNC(op_smalltbl_4)[] = {
+const struct cputbl CPUFUNC(op_smalltbl_4)[] = {
 { CPUFUNC(op_0_0), 0, 0 }, /* OR.B #<data>.B,Dn */
 { CPUFUNC(op_10_0), 0, 16 }, /* OR.B #<data>.B,(An) */
 { CPUFUNC(op_18_0), 0, 24 }, /* OR.B #<data>.B,(An)+ */

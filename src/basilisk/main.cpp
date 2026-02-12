@@ -103,6 +103,11 @@ bool InitAll(const char *vmdir)
 	CPUIs68060 = false;
 #endif
 
+	// Reserve hot CPU tables before subsystem init fragments internal SRAM.
+	// This improves CPU dispatch performance without changing runtime behavior.
+	if (!PreallocateCPUHotData())
+		return false;
+
 	// Load XPRAM
 	XPRAMInit(vmdir);
 

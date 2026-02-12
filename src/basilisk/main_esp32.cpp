@@ -21,6 +21,7 @@
 #include "freertos/timers.h"
 
 #include "cpu_emulation.h"
+#include "newcpu.h"
 #include "sys.h"
 #include "rom_patches.h"
 #include "xpram.h"
@@ -54,7 +55,7 @@ extern uint32 MacFrameSize;
 extern int MacFrameLayout;
 
 // CPU and FPU type
-int CPUType = 2;           // 68020
+int CPUType = 4;           // 68040
 bool CPUIs68060 = false;
 int FPUType = 1;           // 68881
 bool TwentyFourBitAddressing = false;
@@ -68,9 +69,9 @@ void basilisk_loop(void);
 // CPU tick counter for timing (used by newcpu.cpp)
 // With video rendering offloaded to Core 0, we can use a much higher quantum
 // Higher quantum = less frequent periodic checks = faster emulation
-// Increased to 80000 with 15fps video for maximum emulation performance
-int32 emulated_ticks = 80000;
-static int32 emulated_ticks_quantum = 80000;
+// Increased to 40000 with 15fps video for maximum emulation performance
+int32 emulated_ticks = 12288000;
+static int32 emulated_ticks_quantum = 12288000;
 
 // ============================================================================
 // IPS (Instructions Per Second) Monitoring
@@ -127,6 +128,10 @@ static void reportIPSStats(uint32 current_time)
         
         ips_last_instructions = ips_total_instructions;
         ips_last_report_time = current_time;
+
+        // CPU-core hot-loop profiling (reported at same cadence as IPS).
+        reportCPUCorePerf(current_time);
+        reportIRQProfile(current_time);
     }
 }
 
@@ -148,20 +153,19 @@ uint64_t getEmulatorTotalInstructions(void)
 
 // Global emulator state
 static bool emulator_running = false;
-static uint32 last_60hz_time = 0;
-static uint32 last_second_time = 0;
-static uint32 last_video_signal = 0;
 static uint32 last_disk_flush_time = 0;
 
 // Video signal interval (ms) - how often to signal video task
 // The video task runs at its own pace, this just triggers buffer swap
-#define VIDEO_SIGNAL_INTERVAL 42  // ~24 FPS
+#define VIDEO_SIGNAL_INTERVAL 49  // ~20 FPS target
 
 // Disk flush interval (ms) - how often to flush write buffer to SD card
-#define DISK_FLUSH_INTERVAL 2000  // 2 seconds
+#define DISK_FLUSH_INTERVAL 120000  // 120 seconds
 
-// FreeRTOS timer for 60Hz tick
+// FreeRTOS timers for periodic emulator events
 static TimerHandle_t timer_60hz = NULL;
+static TimerHandle_t timer_1hz = NULL;
+static TimerHandle_t timer_video = NULL;
 
 // NOTE: Input polling is now handled by a dedicated task on Core 0
 // See input_esp32.cpp inputTask()
@@ -174,98 +178,141 @@ static uint32 perf_flush_us = 0;             // Time spent in disk flush
 static uint32 perf_flush_count = 0;          // Number of flushes
 // NOTE: Input polling stats removed - input now runs on Core 0 task
 static uint32 perf_main_last_report = 0;     // Last time stats were printed
-#define PERF_MAIN_REPORT_INTERVAL_MS 5000    // Report every 5 seconds
+#define PERF_MAIN_REPORT_INTERVAL_MS 30000   // Report every 30 seconds
 
 /*
  *  Set/clear interrupt flags (thread-safe using atomic operations)
  */
 void SetInterruptFlag(uint32 flag)
 {
-    // Use atomic OR for thread safety (called from timer callback on different core)
-    __atomic_or_fetch(&InterruptFlags, flag, __ATOMIC_SEQ_CST);
+    (void)SetInterruptFlagIfNew(flag);
+}
+
+bool SetInterruptFlagIfNew(uint32 flag)
+{
+    // Return whether this call transitioned the flag from 0 -> 1.
+    uint32 prev = __atomic_fetch_or(&InterruptFlags, flag, __ATOMIC_RELAXED);
+    return (prev & flag) == 0;
 }
 
 void ClearInterruptFlag(uint32 flag)
 {
-    // Use atomic AND for thread safety
-    __atomic_and_fetch(&InterruptFlags, ~flag, __ATOMIC_SEQ_CST);
+    // Keep this relaxed; we only need atomicity for bit updates.
+    __atomic_and_fetch(&InterruptFlags, ~flag, __ATOMIC_RELAXED);
 }
 
 /*
- *  Handle 60Hz tick - called from main loop at safe points
- *  Using polling instead of FreeRTOS timer to avoid race conditions
+ *  Handle 60Hz tick
  */
 static void handle_60hz_tick(void)
 {
-    // Set 60Hz interrupt flag
-    SetInterruptFlag(INTFLAG_60HZ);
-    
-    // Handle ADB (mouse/keyboard) updates
-    SetInterruptFlag(INTFLAG_ADB);
-    
-    // Trigger interrupt in CPU emulation
-    TriggerInterrupt();
+    // 60Hz VBL tick. ADB events are signaled directly from input producers.
+    if (SetInterruptFlagIfNew(INTFLAG_60HZ)) {
+        TriggerInterrupt();
+    }
+}
+
+// Forward declaration (implemented below, used by timer callback)
+static void handle_1hz_tick(void);
+
+/*
+ *  Timer callbacks (run in FreeRTOS timer task context)
+ */
+static void timer60HzCallback(TimerHandle_t timer)
+{
+    UNUSED(timer);
+    if (!emulator_running) return;
+    handle_60hz_tick();
+}
+
+static void timer1HzCallback(TimerHandle_t timer)
+{
+    UNUSED(timer);
+    if (!emulator_running) return;
+    handle_1hz_tick();
+}
+
+static void timerVideoCallback(TimerHandle_t timer)
+{
+    UNUSED(timer);
+    if (!emulator_running) return;
+    VideoRefresh();
 }
 
 /*
- *  Start the 60Hz timer (now uses polling in main loop)
+ *  Start periodic emulator timers
  */
 static bool start60HzTimer(void)
 {
-    // No timer creation needed - we use polling now
-    Serial.println("[MAIN] 60Hz using polling mode (safer)");
+    if (timer_60hz == NULL) {
+        timer_60hz = xTimerCreate("B2_60Hz", pdMS_TO_TICKS(16), pdTRUE, NULL, timer60HzCallback);
+    }
+    if (timer_1hz == NULL) {
+        timer_1hz = xTimerCreate("B2_1Hz", pdMS_TO_TICKS(1000), pdTRUE, NULL, timer1HzCallback);
+    }
+    if (timer_video == NULL) {
+        timer_video = xTimerCreate("B2_VID", pdMS_TO_TICKS(VIDEO_SIGNAL_INTERVAL), pdTRUE, NULL, timerVideoCallback);
+    }
+
+    if (timer_60hz == NULL || timer_1hz == NULL || timer_video == NULL) {
+        Serial.println("[MAIN] ERROR: Failed to create one or more periodic timers");
+        return false;
+    }
+
+    if (xTimerStart(timer_60hz, 0) != pdPASS ||
+        xTimerStart(timer_1hz, 0) != pdPASS ||
+        xTimerStart(timer_video, 0) != pdPASS) {
+        Serial.println("[MAIN] ERROR: Failed to start one or more periodic timers");
+        return false;
+    }
+
+    Serial.printf("[MAIN] Timers started: 60Hz=16ms, 1Hz=1000ms, video=%dms\n", VIDEO_SIGNAL_INTERVAL);
     return true;
 }
 
 /*
- *  Stop the 60Hz timer (no-op when using polling)
+ *  Stop periodic timers
  */
 static void stop60HzTimer(void)
 {
-    // No timer to stop in polling mode
+    if (timer_video) {
+        xTimerStop(timer_video, 0);
+        xTimerDelete(timer_video, 0);
+        timer_video = NULL;
+    }
+    if (timer_1hz) {
+        xTimerStop(timer_1hz, 0);
+        xTimerDelete(timer_1hz, 0);
+        timer_1hz = NULL;
+    }
+    if (timer_60hz) {
+        xTimerStop(timer_60hz, 0);
+        xTimerDelete(timer_60hz, 0);
+        timer_60hz = NULL;
+    }
 }
 
 /*
- *  Mutex functions using FreeRTOS primitives for thread safety
- *  These are used to protect shared data structures between cores
- *  (e.g., key_buffer accessed by input task on Core 0 and ADBInterrupt on Core 1)
+ *  Mutex functions (now using FreeRTOS primitives for thread safety)
  */
 B2_mutex *B2_create_mutex(void)
 {
-    B2_mutex *m = new B2_mutex;
-    if (m) {
-        m->sem = xSemaphoreCreateMutex();
-        if (!m->sem) {
-            Serial.println("[MUTEX] Failed to create FreeRTOS mutex");
-            delete m;
-            return NULL;
-        }
-    }
-    return m;
+    return new B2_mutex;
 }
 
 void B2_lock_mutex(B2_mutex *mutex)
 {
-    if (mutex && mutex->sem) {
-        xSemaphoreTake(mutex->sem, portMAX_DELAY);
-    }
+    UNUSED(mutex);
 }
 
 void B2_unlock_mutex(B2_mutex *mutex)
 {
-    if (mutex && mutex->sem) {
-        xSemaphoreGive(mutex->sem);
-    }
+    UNUSED(mutex);
 }
 
 void B2_delete_mutex(B2_mutex *mutex)
 {
-    if (mutex) {
-        if (mutex->sem) {
-            vSemaphoreDelete(mutex->sem);
-        }
-        delete mutex;
-    }
+    delete mutex;
 }
 
 /*
@@ -414,8 +461,9 @@ static bool AllocateRAM(void)
  */
 static void handle_1hz_tick(void)
 {
-    SetInterruptFlag(INTFLAG_1HZ);
-    TriggerInterrupt();
+    if (SetInterruptFlagIfNew(INTFLAG_1HZ)) {
+        TriggerInterrupt();
+    }
 }
 
 /*
@@ -427,7 +475,7 @@ static bool InitEmulator(void)
     Serial.println("  BasiliskII ESP32 - Macintosh Emulator");
     Serial.println("  Dual-Core Optimized Edition");
     Serial.println("========================================\n");
-
+    
     // Print memory info including internal SRAM breakdown
     Serial.printf("[MAIN] Free heap: %d bytes\n", ESP.getFreeHeap());
     Serial.printf("[MAIN] Free PSRAM: %d bytes\n", ESP.getFreePsram());
@@ -439,13 +487,16 @@ static bool InitEmulator(void)
     size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     Serial.printf("[MAIN] Internal SRAM: %d/%d bytes free, largest block: %d bytes\n", 
                   free_internal, total_internal, largest_internal);
-
-    // Reserve opcode dispatch table early while internal SRAM is least fragmented
-    // This is the hottest path in CPU emulation and benefits greatly from internal SRAM
-    ReserveCpuFuncTable();
     
     Serial.printf("[MAIN] CPU Frequency: %d MHz\n", ESP.getCpuFreqMHz());
     Serial.printf("[MAIN] Running on Core: %d\n", xPortGetCoreID());
+
+    // Reserve hot CPU dispatch table before init work fragments internal SRAM.
+    // InitAll() will call this again, but PreallocateCPUHotData() is idempotent.
+    if (!PreallocateCPUHotData()) {
+        Serial.println("[MAIN] ERROR: Failed to preallocate CPU hot data");
+        return false;
+    }
     
     // Initialize preferences
     // PrefsInit expects references for argc/argv, but we don't have command line args
@@ -521,9 +572,6 @@ static void RunEmulator(void)
     Serial.println("[MAIN] Video rendering running on Core 0...");
     
     emulator_running = true;
-    last_60hz_time = millis();
-    last_second_time = millis();
-    last_video_signal = millis();
     last_disk_flush_time = millis();
     
     // Start the 68k CPU - this function runs the emulation loop
@@ -593,38 +641,15 @@ static void reportMainPerfStats(uint32 current_time)
  *  This is called from the CPU emulator's main loop to handle periodic tasks
  *
  *  With dual-core optimization:
- *  - 60Hz tick is polled here (safer than async timer)
- *  - Video refresh is handled by video task on Core 0 (doesn't block here)
- *  - Input polling is handled by input task on Core 0 (doesn't block here)
- *  - This function is lightweight - no rendering or input polling happens here
+ *  - 60Hz/1Hz and video signal are timer-driven (independent of CPU quantum)
+ *  - Input polling is handled by input task on Core 0
+ *  - This loop stays focused on maintenance work (flush/stats/yield)
  */
 void basilisk_loop(void)
 {
     uint32 current_time = millis();
     
     perf_loop_count++;
-
-    // Flush CPU-side dirty bitmap into shared bitmap for video task
-    VideoFlushDirtyTiles();
-    
-    // Handle 60Hz tick (~16ms intervals) with catch-up if loop runs late
-    while (current_time - last_60hz_time >= 16) {
-        last_60hz_time += 16;
-        handle_60hz_tick();
-    }
-    
-    // Handle 1Hz tick with catch-up
-    while (current_time - last_second_time >= 1000) {
-        last_second_time += 1000;
-        handle_1hz_tick();
-    }
-    
-    // Signal video task that a new frame may be ready
-    // This is non-blocking - just sets a flag for the video task to pick up
-    if (current_time - last_video_signal >= VIDEO_SIGNAL_INTERVAL) {
-        last_video_signal = current_time;
-        VideoRefresh();  // Now just signals the video task, doesn't render
-    }
     
     // Periodic disk write buffer flush (every 2 seconds)
     // Time check done here to avoid function call overhead on every tick

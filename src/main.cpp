@@ -19,6 +19,7 @@
 #define SD_SPI_MISO  39
 #define SD_SPI_CS    42
 
+
 // Forward declarations for BasiliskII functions
 extern void basilisk_setup(void);
 extern void basilisk_loop(void);
@@ -69,12 +70,15 @@ bool initSDCard() {
     // Initialize SPI with Tab5 SD card pins
     SPI.begin(SD_SPI_SCK, SD_SPI_MISO, SD_SPI_MOSI, SD_SPI_CS);
     
-    // Try to initialize SD card with explicit CS pin
-    if (!SD.begin(SD_SPI_CS, SPI, 25000000)) {
+    // Use a conservative clock for stable sustained throughput across cards.
+    constexpr uint32_t kSdSpiHz = 25000000;
+    if (!SD.begin(SD_SPI_CS, SPI, kSdSpiHz)) {
         Serial.println("[MAIN] ERROR: SD card initialization failed!");
         Serial.println("[MAIN] Make sure SD card is inserted and formatted as FAT32");
         return false;
     }
+
+    Serial.printf("[MAIN] SD SPI clock: %u Hz\n", kSdSpiHz);
     
     uint64_t cardSize = SD.cardSize() / (1024 * 1024);
     Serial.printf("[MAIN] SD card initialized: %lluMB\n", cardSize);
@@ -104,11 +108,11 @@ void setup() {
     // Initialize M5Stack Tab5
     auto cfg = M5.config();
     M5.begin(cfg);
-    
+
     // Initialize serial
     Serial.begin(115200);
     delay(500);
-    
+
     Serial.println("\n\n========================================");
     Serial.println("  BasiliskII ESP32 - Macintosh Emulator");
     Serial.println("  M5Stack Tab5 Edition");

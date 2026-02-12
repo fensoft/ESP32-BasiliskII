@@ -31,7 +31,9 @@
 #define INPUT_TASK_STACK_SIZE 4096
 #define INPUT_TASK_PRIORITY   1
 #define INPUT_TASK_CORE       0  // Run on Core 0, leaving Core 1 for CPU emulation
-#define INPUT_POLL_INTERVAL_MS 16  // 60Hz polling
+#define INPUT_POLL_INTERVAL_MS 20  // 50Hz polling
+#define USB_POLL_DIV_ACTIVE   1   // Poll USB every cycle when devices are active
+#define USB_POLL_DIV_IDLE     4   // Poll USB every 64ms when idle (16ms * 4)
 
 static TaskHandle_t input_task_handle = NULL;
 static volatile bool input_task_running = false;
@@ -801,6 +803,8 @@ static void inputTask(void *param)
     Serial.println("[INPUT] Input task started on Core 0");
     
     const TickType_t poll_interval = pdMS_TO_TICKS(INPUT_POLL_INTERVAL_MS);
+    uint8_t usb_poll_divider = USB_POLL_DIV_ACTIVE;
+    uint8_t usb_poll_counter = 0;
     
     while (input_task_running) {
         // Update M5 library (touch, buttons, etc.)
@@ -809,9 +813,21 @@ static void inputTask(void *param)
         // Process touch input
         processTouchInput();
         
-        // Process USB Host events (this is the slow part ~2ms)
+        // Process USB Host events (this is the slow part ~2ms).
+        // Keep full-rate polling while USB devices are active, but back off when idle.
         if (usbHost != NULL) {
-            usbHost->task();
+            bool usb_active = keyboard_connected || mouse_connected || usbHost->has_keyboard;
+            uint8_t target_divider = usb_active ? USB_POLL_DIV_ACTIVE : USB_POLL_DIV_IDLE;
+            if (target_divider != usb_poll_divider) {
+                usb_poll_divider = target_divider;
+                usb_poll_counter = 0;
+            }
+
+            usb_poll_counter++;
+            if (usb_poll_counter >= usb_poll_divider) {
+                usb_poll_counter = 0;
+                usbHost->task();
+            }
         }
         
         // Update keyboard LEDs (Caps Lock, etc.)
