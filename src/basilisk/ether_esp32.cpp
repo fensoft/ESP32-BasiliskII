@@ -18,6 +18,7 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <esp_heap_caps.h>
 #include <map>
 
 #include "cpu_emulation.h"
@@ -30,6 +31,23 @@
 
 #define DEBUG 0
 #include "debug.h"
+
+// ============================================================================
+// Heap Monitoring for SDIO Stability
+// ============================================================================
+// The ESP32-P4 communicates with the C6 WiFi chip over SDIO. The SDIO driver
+// allocates DMA-capable buffers from internal SRAM. If internal heap runs out,
+// the driver hits a fatal assert. We monitor DMA-capable free heap and throttle
+// network traffic when it drops too low to prevent that crash.
+
+// Below this threshold, we stop sending new packets (backpressure)
+#define HEAP_INTERNAL_CRITICAL   8000
+
+// Below this threshold, we reduce polling frequency to ease memory pressure
+#define HEAP_INTERNAL_LOW        15000
+
+// Minimum interval between heap warning logs (ms) - only logs when pressure detected
+#define HEAP_WARN_INTERVAL_MS    60000
 
 // ============================================================================
 // Global Variables
@@ -269,6 +287,15 @@ int16 ether_write(uint32 wds)
         return excessCollsns;
     }
     
+    // Check internal SRAM before sending. The SDIO driver allocates DMA
+    // buffers from internal SRAM; exhausting it causes a fatal assert in
+    // sdio_rx_get_buffer().
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (internal_free < HEAP_INTERNAL_CRITICAL) {
+        D(bug("[ETHER] Internal heap critical (%u bytes), dropping outgoing packet\n", internal_free));
+        return excessCollsns;
+    }
+    
     // Convert WDS to linear buffer
     uint8 packet[1514];
     int len = ether_wds_to_buffer(wds, packet);
@@ -390,14 +417,36 @@ void EtherInterrupt(void)
  */
 static void net_rx_task(void *param)
 {
-    Serial.println("[ETHER] Network RX task started");
+    Serial.println("[ETHER] Network RX task started on Core 0");
     uint16_t idle_polls = 0;
+    uint32_t last_heap_warn = 0;
     
     while (net_rx_task_running) {
         // If WiFi has dropped, sleep longer to avoid busy-looping on dead sockets
         if (WiFi.status() != WL_CONNECTED) {
             idle_polls = 0;
             vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        
+        // Monitor internal SRAM. The SDIO driver allocates receive buffers
+        // from internal SRAM; if it runs out, sdio_rx_get_buffer() asserts.
+        // When memory is low, we back off polling to reduce SDIO traffic and
+        // give the driver time to free buffers.
+        size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        
+        bool heap_critical = (internal_free < HEAP_INTERNAL_CRITICAL);
+        bool heap_low = (internal_free < HEAP_INTERNAL_LOW);
+        
+        if (heap_critical) {
+            // Log at most once per minute to avoid spamming
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now - last_heap_warn > HEAP_WARN_INTERVAL_MS) {
+                Serial.printf("[ETHER] Internal heap critical (%u bytes), throttling network\n", internal_free);
+                last_heap_warn = now;
+            }
+            // Critical: stop polling entirely for a bit to let SDIO drain
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
         
@@ -416,10 +465,13 @@ static void net_rx_task(void *param)
         }
         
         // Adaptive backoff:
+        // - heap low: poll less often to reduce SDIO pressure
         // - active traffic: keep low latency
         // - idle: poll less often to reduce Core 0 load and memory bus contention
         uint32_t delay_ms = 5;
-        if (!has_pending) {
+        if (heap_low) {
+            delay_ms = 50;  // Ease pressure when DMA heap is getting tight
+        } else if (!has_pending) {
             if (idle_polls > 40) {
                 delay_ms = 30;
             } else if (idle_polls > 10) {

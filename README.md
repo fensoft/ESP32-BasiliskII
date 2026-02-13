@@ -39,13 +39,15 @@ A full port of the **BasiliskII** Macintosh 68k emulator to the ESP32-P4 microco
 
 ## Overview
 
-This project runs a **Motorola 68040** emulator that can boot real Macintosh ROMs and run genuine classic Mac OS software. Performance is comparable to a **Mac IIci** (25 MHz 68030), achieving **24 FPS video** and **1.5-3 MIPS** CPU speed. The emulation includes:
+This project runs a **Motorola 68040** emulator that can boot real Macintosh ROMs and run genuine classic Mac OS software. Performance is comparable to a **Macintosh Quadra 610** (25 MHz 68040), achieving **24 FPS video** and **2-3 MIPS** CPU speed. The emulation includes:
 
-- **CPU**: Motorola 68040 emulation with FPU (68881) — 1.5-3 MIPS
+- **CPU**: Motorola 68040 emulation with FPU (68881) — 2-3 MIPS
 - **RAM**: Configurable from 4MB to 16MB (allocated from ESP32-P4's 32MB PSRAM)
 - **Display**: 640×360 virtual display (2× scaled to 1280×720 physical display), supporting 1/2/4/8-bit color depths at 24 FPS
 - **Storage**: Hard disk and CD-ROM images loaded from SD card
 - **Input**: Capacitive touchscreen (as mouse) + USB keyboard/mouse support
+- **Audio**: Classic Mac sound output via ES8388 codec (toggleable in boot GUI)
+- **Networking**: WiFi internet access via NAT router (TCP, UDP, ICMP, DHCP)
 - **Video**: Optimized pipeline with write-time dirty tracking, double-buffered DMA, and tile-based rendering
 
 ## Hardware
@@ -57,7 +59,7 @@ The Tab5 features a unique **dual-chip architecture** that makes it ideal for th
 | Chip | Role | Key Features |
 |------|------|--------------|
 | **ESP32-P4** | Main Application Processor | 400MHz dual-core RISC-V, 32MB PSRAM, MIPI-DSI display |
-| **ESP32-C6** | Wireless Co-processor | WiFi 6, Bluetooth LE 5.0 (not used by emulator) |
+| **ESP32-C6** | Wireless Co-processor | WiFi 6, Bluetooth LE 5.0 — provides internet access to classic Mac OS |
 
 ### Key Specifications
 
@@ -68,6 +70,7 @@ The Tab5 features a unique **dual-chip architecture** that makes it ideal for th
 | **Memory** | 32MB PSRAM for emulated Mac RAM + frame buffers |
 | **Storage** | microSD card slot for ROM, disk images, and settings |
 | **USB** | Type-A host port for keyboard/mouse, Type-C for programming |
+| **Audio** | ES8388 DAC/ADC codec — classic Mac sound output |
 | **Battery** | NP-F550 Li-ion (2000mAh) for portable operation |
 
 See [boardConfig.md](boardConfig.md) for detailed pin mappings and hardware documentation.
@@ -92,7 +95,9 @@ The emulator leverages the ESP32-P4's dual-core RISC-V architecture for optimal 
 │  • 2×2 pixel scaling       │  • Write-time dirty marking        │
 │  • Input task (60Hz)       │  • Batch instruction execution     │
 │  • USB HID processing      │  • ROM patching                    │
-│  • Event-driven @ 24 FPS   │  • Disk I/O                        │
+│  • Audio output (ES8388)   │  • Disk I/O                        │
+│  • Network RX polling      │                                    │
+│  • Event-driven @ 24 FPS   │                                    │
 └────────────────────────────┴────────────────────────────────────┘
 ```
 
@@ -195,6 +200,8 @@ This port includes the following BasiliskII subsystems, adapted for ESP32:
 | **XPRAM** | `xpram_esp32.cpp` | Non-volatile parameter RAM |
 | **Timer** | `timer_esp32.cpp` | 60Hz/1Hz tick generation |
 | **ROM Patches** | `rom_patches.cpp` | Compatibility patches for ROMs |
+| **Audio** | `audio_esp32.cpp` | Sound output via ES8388 codec |
+| **Networking** | `ether_esp32.cpp`, `net_router.cpp` | WiFi NAT router (TCP/UDP/ICMP/DHCP) |
 | **Input** | `input_esp32.cpp` | Touch + USB HID handling |
 
 ### Supported ROMs
@@ -279,7 +286,7 @@ esptool.py --chip esp32p4 \
     --port /dev/ttyACM0 \
     --baud 921600 \
     write_flash \
-    0x0 M5Tab-Macintosh-v2.0.1.bin
+    0x0 M5Tab-Macintosh-v3.0.bin
 ```
 
 **Note**: Replace `/dev/ttyACM0` with your actual port:
@@ -318,16 +325,16 @@ For versioned releases, use the release script:
 
 ```bash
 # Create a versioned release binary
-./scripts/build_release.sh v2.9
+./scripts/build_release.sh v3.0
 
-# Output: release/M5Tab-Macintosh-v2.9.bin
+# Output: release/M5Tab-Macintosh-v3.0.bin
 ```
 
 The release binary can be flashed with a single esptool command:
 
 ```bash
 esptool --chip esp32p4 --port /dev/cu.usbmodem* \
-    --baud 921600 write-flash 0x0 release/M5Tab-Macintosh-v2.9.bin
+    --baud 921600 write-flash 0x0 release/M5Tab-Macintosh-v3.0.bin
 ```
 
 ---
@@ -366,6 +373,7 @@ On startup, a **classic Mac-style boot configuration screen** appears:
 | Hard Disk | Any `.dsk` or `.img` file on SD root | First found |
 | CD-ROM | Any `.iso` file on SD root, or None | None |
 | RAM Size | 4 MB, 8 MB, 12 MB, 16 MB | 8 MB |
+| Audio | Enable/disable sound output | Enabled |
 | WiFi | Configure SSID and password | None |
 
 ### WiFi Setup
@@ -474,6 +482,7 @@ M5Tab-Macintosh/
 │       ├── boot_gui.cpp            # Pre-boot configuration GUI
 │       ├── sys_esp32.cpp           # SD card disk I/O
 │       ├── timer_esp32.cpp         # 60Hz/1Hz interrupt generation
+│       ├── audio_esp32.cpp          # Sound output via ES8388 codec
 │       ├── ether_esp32.cpp         # Network driver for WiFi NAT
 │       ├── net_router.cpp          # TCP/UDP/ICMP NAT router
 │       ├── xpram_esp32.cpp         # NVRAM persistence to SD
@@ -495,16 +504,16 @@ M5Tab-Macintosh/
 
 ## Performance
 
-The emulator achieves **usable desktop performance**, comparable to a real **Macintosh IIci** (25 MHz 68030).
+The emulator achieves **smooth desktop performance**, comparable to a real **Macintosh Quadra 610** (25 MHz 68040). Extensive optimization work on CPU scheduling, video rendering, disk I/O, and memory placement delivers a responsive experience across Mac OS 7 and 8.
 
 ### Benchmarks
 
 | Metric | Value |
 |--------|-------|
-| **CPU Speed** | 1.5 - 3 MIPS (depending on workload) |
+| **CPU Speed** | 2 - 3 MIPS (depending on workload) |
 | **Video Refresh** | 24 FPS (cinema-standard smooth) |
 | **Boot Time** | ~15 seconds to Mac OS desktop |
-| **Comparison** | Similar to Mac IIci (25 MHz 68030) |
+| **Comparison** | Similar to Macintosh Quadra 610 (25 MHz 68040) |
 | Typical Dirty Tiles | 5-15 tiles/frame (vs. 144 total) |
 | Video CPU Savings | 60-90% reduction with dirty tracking |
 
@@ -526,7 +535,11 @@ The emulator achieves **usable desktop performance**, comparable to a real **Mac
 
 8. **Memory Bank Placement**: The 256KB memory bank pointer array and CPU function table are allocated in internal SRAM for faster access.
 
-9. **Aggressive Compiler Optimizations**: Build uses `-O3`, `-funroll-loops`, `-ffast-math`, and aggressive inlining for hot paths.
+9. **Adaptive CPU/IO Scheduling**: CPU emulation, disk I/O, video rendering, and network polling are carefully balanced across both cores with adaptive timing to maximize throughput without starving any subsystem.
+
+10. **PSRAM Allocation for Network Buffers**: Packet buffers and temporary allocations use PSRAM to keep internal SRAM free for the SDIO WiFi driver's DMA buffers, preventing crashes under heavy network load.
+
+11. **Aggressive Compiler Optimizations**: Build uses `-O3`, `-funroll-loops`, `-ffast-math`, and aggressive inlining for hot paths.
 
 ---
 
@@ -561,6 +574,7 @@ build_flags =
 | Touch not responding | Wait for boot GUI to complete initialization |
 | USB keyboard not working | Connect to Type-A port (not Type-C) |
 | Slow/choppy display | Check serial for `[VIDEO PERF]` stats; typical is 60-90% partial updates |
+| No audio output | Ensure audio is enabled in the boot GUI settings screen |
 | Screen flickering/tearing | May occur during heavy graphics; dirty tracking minimizes this |
 
 ### Serial Debug Output
@@ -586,9 +600,9 @@ Look for initialization messages:
 [MAIN] CPU Freq: 360 MHz
 [VIDEO] Display size: 1280x720
 [VIDEO] Mac frame buffer allocated: 0x48100000 (230400 bytes)
-[VIDEO] Triple buffers allocated: snapshot, compare (230400 bytes each)
-[VIDEO] Dirty tracking: 16x9 tiles (144 total), threshold 80%
+[VIDEO] Dirty tracking: 16x9 tiles (144 total)
 [VIDEO] Video task created on Core 0 (write-time dirty tracking)
+[AUDIO] Audio initialized (ES8388 codec)
 ```
 
 During operation, performance stats are reported every 5 seconds:
@@ -596,7 +610,6 @@ During operation, performance stats are reported every 5 seconds:
 ```
 [IPS] 2847523 instructions/sec (2.85 MIPS), total: 142376150
 [VIDEO PERF] frames=75 (full=2 partial=68 skip=5)
-[VIDEO PERF] avg: detect=45us render=8234us
 ```
 
 ---
@@ -607,7 +620,7 @@ During operation, performance stats are reported every 5 seconds:
 - **UAE** (Unix Amiga Emulator) — the CPU emulation core
 - **[M5Stack](https://shop.m5stack.com/products/m5stack-tab5-iot-development-kit-esp32-p4)** — for the excellent Tab5 hardware and M5Unified/M5GFX libraries
 - **EspUsbHost** — USB HID support for ESP32
-- **Claude Opus 4.5** (Anthropic) — AI pair programmer that made this port possible
+- **Claude** (Anthropic) — AI pair programmer that made this port possible
 
 ---
 
@@ -619,6 +632,6 @@ This project is based on BasiliskII, which is licensed under the **GNU General P
 
 
 
-*This project was built with the assistance of [Claude Opus 4.5](https://anthropic.com). I am in no way smart enough to have done this on my own.* 🤖🍎
+*This project was built with the assistance of [Claude](https://anthropic.com). I am in no way smart enough to have done this on my own.* 🤖🍎
 
 *Run classic Mac OS in your pocket.*

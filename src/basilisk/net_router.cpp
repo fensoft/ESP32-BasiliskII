@@ -20,6 +20,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <esp_heap_caps.h>
 #include <errno.h>
 
 #include "cpu_emulation.h"
@@ -29,6 +30,11 @@
 
 #define DEBUG 0
 #include "debug.h"
+
+// Internal SRAM threshold - don't create new sockets when below this.
+// The SDIO driver (which bridges P4 <-> C6 WiFi) allocates DMA buffers from
+// internal SRAM. Exhausting it causes a fatal assert in sdio_rx_get_buffer().
+#define ROUTER_INTERNAL_HEAP_MIN  8000
 
 // ============================================================================
 // Configuration
@@ -66,8 +72,8 @@ typedef struct {
     int len;
 } packet_buffer_t;
 
-// Pre-allocated packet buffers
-static packet_buffer_t packet_buffers[PACKET_QUEUE_SIZE];
+// Pre-allocated packet buffers (allocated from PSRAM in router_init)
+static packet_buffer_t *packet_buffers = nullptr;
 static int next_buffer = 0;
 
 // Router initialized flag
@@ -274,7 +280,7 @@ static void close_expired_connections(void)
 
 void router_enqueue_packet(uint8 *packet, int len)
 {
-    if (rx_packet_queue == nullptr || len > MAX_PACKET_SIZE || len <= 0) {
+    if (rx_packet_queue == nullptr || packet_buffers == nullptr || len > MAX_PACKET_SIZE || len <= 0) {
         return;
     }
     
@@ -403,7 +409,7 @@ static void handle_arp(arp_pkt_t *arp, int len)
 static void send_icmp_reply(icmp_pkt_t *request, int len)
 {
     // Allocate reply packet
-    uint8 *reply_buf = (uint8 *)malloc(len);
+    uint8 *reply_buf = (uint8 *)ps_malloc(len);
     if (reply_buf == nullptr) return;
     
     icmp_pkt_t *reply = (icmp_pkt_t *)reply_buf;
@@ -506,7 +512,7 @@ static void handle_icmp(icmp_pkt_t *icmp, int len)
             
             // Build response packet for MacOS
             int total_len = sizeof(ip_hdr_t) + recv_len;
-            uint8 *reply_buf = (uint8 *)malloc(total_len);
+            uint8 *reply_buf = (uint8 *)ps_malloc(total_len);
             if (reply_buf != nullptr) {
                 icmp_pkt_t *reply = (icmp_pkt_t *)reply_buf;
                 
@@ -590,7 +596,7 @@ static void handle_dhcp(dhcp_pkt_t *dhcp, int len)
     // Build DHCP response
     int reply_options_len = 64;  // Enough for our options
     int reply_len = sizeof(dhcp_pkt_t) + reply_options_len;
-    uint8 *reply_buf = (uint8 *)malloc(reply_len);
+    uint8 *reply_buf = (uint8 *)ps_malloc(reply_len);
     if (reply_buf == nullptr) return;
     
     memset(reply_buf, 0, reply_len);
@@ -754,6 +760,14 @@ static void handle_udp(udp_pkt_t *udp, int len)
     
     net_conn_t *conn = find_connection(IPPROTO_UDP, src_port, dest_port);
     if (conn == nullptr) {
+        // Refuse new connections when internal SRAM is low to protect SDIO driver
+        size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        if (internal_free < ROUTER_INTERNAL_HEAP_MIN) {
+            xSemaphoreGive(conn_mutex);
+            D(bug("[ROUTER] Internal heap low (%u), refusing new UDP connection\n", internal_free));
+            return;
+        }
+        
         conn = alloc_connection();
         if (conn == nullptr) {
             xSemaphoreGive(conn_mutex);
@@ -818,7 +832,7 @@ static void poll_udp_connection(net_conn_t *conn)
     
     // Build UDP packet for MacOS
     int total_len = sizeof(udp_pkt_t) + recv_len;
-    uint8 *pkt_buf = (uint8 *)malloc(total_len);
+    uint8 *pkt_buf = (uint8 *)ps_malloc(total_len);
     if (pkt_buf == nullptr) return;
     
     udp_pkt_t *reply = (udp_pkt_t *)pkt_buf;
@@ -861,7 +875,7 @@ static void poll_udp_connection(net_conn_t *conn)
 static void send_tcp_packet(net_conn_t *conn, uint8 flags, uint8 *data, int data_len)
 {
     int total_len = sizeof(tcp_pkt_t) + data_len;
-    uint8 *pkt_buf = (uint8 *)malloc(total_len);
+    uint8 *pkt_buf = (uint8 *)ps_malloc(total_len);
     if (pkt_buf == nullptr) return;
     
     tcp_pkt_t *tcp = (tcp_pkt_t *)pkt_buf;
@@ -947,6 +961,14 @@ static void handle_tcp(tcp_pkt_t *tcp, int len)
     
     // Handle SYN (new connection)
     if ((flags & TCP_FLAG_SYN) && conn == nullptr) {
+        // Refuse new connections when internal SRAM is low to protect SDIO driver
+        size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        if (internal_free < ROUTER_INTERNAL_HEAP_MIN) {
+            xSemaphoreGive(conn_mutex);
+            D(bug("[ROUTER] Internal heap low (%u), refusing new TCP connection\n", internal_free));
+            return;
+        }
+        
         conn = alloc_connection();
         if (conn == nullptr) {
             xSemaphoreGive(conn_mutex);
@@ -1185,6 +1207,14 @@ void router_poll(void)
         return;
     }
     
+    // Skip polling when internal SRAM is critically low. Each recv() call can
+    // trigger the SDIO driver to allocate more DMA buffers for incoming data.
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (internal_free < ROUTER_INTERNAL_HEAP_MIN) {
+        D(bug("[ROUTER] Internal heap low (%u), skipping poll\n", internal_free));
+        return;
+    }
+    
     if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
         return;
     }
@@ -1234,6 +1264,19 @@ bool router_init(void)
         rx_packet_queue = nullptr;
         return false;
     }
+    
+    // Allocate packet buffers from PSRAM to keep internal SRAM free for SDIO
+    packet_buffers = (packet_buffer_t *)ps_malloc(PACKET_QUEUE_SIZE * sizeof(packet_buffer_t));
+    if (packet_buffers == nullptr) {
+        Serial.println("[ROUTER] Failed to allocate packet buffers in PSRAM");
+        vSemaphoreDelete(conn_mutex);
+        conn_mutex = nullptr;
+        vQueueDelete(rx_packet_queue);
+        rx_packet_queue = nullptr;
+        return false;
+    }
+    memset(packet_buffers, 0, PACKET_QUEUE_SIZE * sizeof(packet_buffer_t));
+    next_buffer = 0;
     
     // Initialize connection table
     memset(connections, 0, sizeof(connections));
@@ -1289,6 +1332,12 @@ void router_exit(void)
     if (rx_packet_queue != nullptr) {
         vQueueDelete(rx_packet_queue);
         rx_packet_queue = nullptr;
+    }
+    
+    // Free packet buffers
+    if (packet_buffers != nullptr) {
+        free(packet_buffers);
+        packet_buffers = nullptr;
     }
     
     Serial.println("[ROUTER] NAT router shut down");
