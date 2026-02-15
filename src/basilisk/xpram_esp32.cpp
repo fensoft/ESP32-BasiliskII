@@ -7,7 +7,11 @@
 #include "sysdeps.h"
 #include "xpram.h"
 
+#ifdef USE_CUSTOMFS
+#include "customfs.h"
+#else
 #include <SD.h>
+#endif
 
 #define DEBUG 1
 #include "debug.h"

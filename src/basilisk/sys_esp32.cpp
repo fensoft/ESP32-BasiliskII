@@ -15,7 +15,11 @@
 #include "prefs.h"
 #include "sys.h"
 
+#ifdef USE_CUSTOMFS
+#include "customfs.h"
+#else
 #include <SD.h>
+#endif
 #include <FS.h>
 
 #define DEBUG 0

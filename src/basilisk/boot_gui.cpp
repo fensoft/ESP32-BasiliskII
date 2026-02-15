@@ -17,7 +17,11 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <M5GFX.h>
+#ifdef USE_CUSTOMFS
+#include "customfs.h"
+#else
 #include <SD.h>
+#endif
 #include <WiFi.h>
 #include <vector>
 #include <string>
@@ -866,11 +870,13 @@ static void initWiFi(void)
     }
     
     Serial.println("[BOOT_GUI] Initializing WiFi...");
-    
+
+#if defined(CONFIG_IDF_TARGET_ESP32C6)
     // Set up SDIO pins for ESP32-C6 communication
     // This is required before any WiFi operations on Tab5
     WiFi.setPins(WIFI_SDIO_CLK, WIFI_SDIO_CMD, WIFI_SDIO_D0, 
                  WIFI_SDIO_D1, WIFI_SDIO_D2, WIFI_SDIO_D3, WIFI_SDIO_RST);
+#endif
     
     // Set WiFi mode to station
     WiFi.mode(WIFI_STA);
@@ -2605,6 +2611,11 @@ const char* BootGUI_GetCDROMPath(void)
 uint32_t BootGUI_GetRAMSize(void)
 {
     return (uint32_t)selected_ram_mb * 1024 * 1024;
+}
+
+void BootGUI_SetRAMSizeMB(int size)
+{
+    selected_ram_mb = size;
 }
 
 int BootGUI_GetRAMSizeMB(void)

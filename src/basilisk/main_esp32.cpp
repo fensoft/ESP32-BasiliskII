@@ -12,7 +12,11 @@
 
 #include <M5Unified.h>
 #include <M5GFX.h>
+#ifdef USE_CUSTOMFS
+#include "customfs.h"
+#else
 #include <SD.h>
+#endif
 #include <esp_heap_caps.h>
 
 // FreeRTOS for dual-core support and timers

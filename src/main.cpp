@@ -9,7 +9,11 @@
 #include <M5Unified.h>
 #include <M5GFX.h>
 #include <SPI.h>
+#ifdef USE_CUSTOMFS
+#include "customfs.h"
+#else
 #include <SD.h>
+#endif
 
 #include "boot_gui.h"
 
