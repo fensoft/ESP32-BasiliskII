@@ -64,18 +64,24 @@
 #define VIDEO_DIRTY_MARK_NOOP 0
 #endif
 
-// Display configuration - 640x360 with 2x pixel doubling for 1280x720 display
+// Display configuration - 640x360 scaled by PIXEL_SCALE
+#ifndef MAC_SCREEN_WIDTH
 #define MAC_SCREEN_WIDTH  640
+#endif
+#ifndef MAC_SCREEN_HEIGHT
 #define MAC_SCREEN_HEIGHT 360
+#endif
 #define MAC_SCREEN_DEPTH  VDEPTH_8BIT  // 8-bit indexed color
-#define PIXEL_SCALE       2            // 2x scaling to fill 1280x720
+#ifndef PIXEL_SCALE
+#define PIXEL_SCALE       2            // Set to 1 for 1:1 pixels, 2 for 2x scaling
+#endif
 
 // Physical display dimensions
-#define DISPLAY_WIDTH     1280
-#define DISPLAY_HEIGHT    720
+#define DISPLAY_WIDTH     (MAC_SCREEN_WIDTH * PIXEL_SCALE)
+#define DISPLAY_HEIGHT    (MAC_SCREEN_HEIGHT * PIXEL_SCALE)
 
 // Tile-based dirty tracking configuration
-// Tile size: 40x40 Mac pixels (80x80 display pixels after 2x scaling)
+// Tile size: 40x40 Mac pixels (scaled by PIXEL_SCALE)
 // Grid: 16 columns x 9 rows = 144 tiles total
 // Coverage: 640x360 exactly (40*16=640, 40*9=360)
 #define TILE_WIDTH        40
@@ -136,11 +142,11 @@ DRAM_ATTR static uint8 tile_row_base_lut[MAC_SCREEN_HEIGHT];
 static bool tile_lut_initialized = false;
 
 // Double-buffered row buffers for streaming full-frame renders with async DMA
-// Processes 4 Mac rows at a time (becomes 8 display rows with 2x scaling)
-// Size: 1280 pixels * 8 rows * 2 bytes = 20,480 bytes (20KB) per buffer
+// Processes 4 Mac rows at a time (becomes 4 or 8 display rows depending on scale)
+// Size depends on DISPLAY_WIDTH and STREAMING_ROW_COUNT
 // Double-buffering allows rendering to one buffer while DMA pushes the other
 // In internal SRAM for fast access during full-frame renders
-#define STREAMING_ROW_COUNT 8
+#define STREAMING_ROW_COUNT (4 * PIXEL_SCALE)
 DRAM_ATTR static uint16 streaming_row_buffer_a[DISPLAY_WIDTH * STREAMING_ROW_COUNT];
 DRAM_ATTR static uint16 streaming_row_buffer_b[DISPLAY_WIDTH * STREAMING_ROW_COUNT];
 static uint16 *render_buffer = streaming_row_buffer_a;
@@ -792,13 +798,34 @@ static void snapshotTile(uint8 *src_buffer, int tile_x, int tile_y, uint8 *snaps
  */
 static void renderTileFromSnapshot(uint8 *snapshot, uint16 *local_palette, uint16 *out_buffer)
 {
-    int tile_pixel_width = TILE_WIDTH * PIXEL_SCALE;  // 80 pixels
+    int tile_pixel_width = TILE_WIDTH * PIXEL_SCALE;
     
     uint8 *src = snapshot;
     uint16 *out = out_buffer;
     
     // Process each row of the Mac tile
     for (int row = 0; row < TILE_HEIGHT; row++) {
+#if PIXEL_SCALE == 1
+        uint16 *dst = out;
+
+        int x = 0;
+        for (; x < TILE_WIDTH - 3; x += 4) {
+            uint32 src4 = *((uint32 *)src);
+            src += 4;
+
+            dst[0] = local_palette[src4 & 0xFF];
+            dst[1] = local_palette[(src4 >> 8) & 0xFF];
+            dst[2] = local_palette[(src4 >> 16) & 0xFF];
+            dst[3] = local_palette[(src4 >> 24) & 0xFF];
+            dst += 4;
+        }
+
+        for (; x < TILE_WIDTH; x++) {
+            *dst++ = local_palette[*src++];
+        }
+
+        out += tile_pixel_width;
+#else
         // Output row pointers (two rows for 2x vertical scaling)
         uint16 *dst_row0 = out;
         uint16 *dst_row1 = out + tile_pixel_width;
@@ -843,6 +870,7 @@ static void renderTileFromSnapshot(uint8 *snapshot, uint16 *local_palette, uint1
         
         // Move output pointer by 2 rows (2x vertical scaling)
         out += tile_pixel_width * 2;
+#endif
     }
 }
 
@@ -957,7 +985,7 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
  *  Render frame buffer directly to display using streaming (no intermediate PSRAM buffer)
  *  
  *  This optimized version eliminates the 1.8MB dsi_framebuffer by:
- *  1. Processing 2 Mac rows at a time (becomes 4 display rows with 2x scaling)
+ *  1. Processing 2 Mac rows at a time (scaled by PIXEL_SCALE)
  *  2. Converting 8-bit indexed to RGB565 into internal SRAM row buffer
  *  3. Immediately pushing to display via M5GFX
  *  
@@ -984,7 +1012,7 @@ static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
     
     M5.Display.startWrite();
     
-    // Process 4 Mac rows at a time (produces 8 display rows with 2x scaling)
+    // Process 4 Mac rows at a time (produces 4 or 8 display rows depending on scale)
     // Double-buffering: render to one buffer while DMA pushes the other
     for (int mac_y = 0; mac_y < MAC_SCREEN_HEIGHT; mac_y += 4) {
         uint16 *out = render_buffer;
@@ -1008,6 +1036,27 @@ static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
                 pixel_row = decoded_row;
             }
             
+#if PIXEL_SCALE == 1
+            uint16 *dst_row0 = out;
+            
+            // Process 4 decoded pixels at a time for better memory bandwidth
+            int x = 0;
+            for (; x < MAC_SCREEN_WIDTH - 3; x += 4) {
+                uint32 src4 = *((uint32 *)(pixel_row + x));
+                dst_row0[0] = local_palette[src4 & 0xFF];
+                dst_row0[1] = local_palette[(src4 >> 8) & 0xFF];
+                dst_row0[2] = local_palette[(src4 >> 16) & 0xFF];
+                dst_row0[3] = local_palette[(src4 >> 24) & 0xFF];
+                dst_row0 += 4;
+            }
+            
+            for (; x < MAC_SCREEN_WIDTH; x++) {
+                *dst_row0++ = local_palette[pixel_row[x]];
+            }
+            
+            // Move output pointer by 1 display row (1:1 scaling)
+            out += DISPLAY_WIDTH;
+#else
             // Output row pointers for the two scaled display rows
             uint16 *dst_row0 = out;
             uint16 *dst_row1 = out + DISPLAY_WIDTH;
@@ -1051,6 +1100,7 @@ static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
             
             // Move output pointer by 2 display rows (2x vertical scaling)
             out += DISPLAY_WIDTH * 2;
+#endif
         }
         
         // Wait for any pending DMA transfer to complete before swapping buffers

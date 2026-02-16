@@ -2603,6 +2603,17 @@ const char* BootGUI_GetDiskPath(void)
     return selected_disk_path;
 }
 
+void BootGUI_SetDiskPath(const char* path)
+{
+    if (path == nullptr || path[0] == '\0') {
+        selected_disk_path[0] = '\0';
+        return;
+    }
+
+    strncpy(selected_disk_path, path, BOOT_GUI_MAX_PATH - 1);
+    selected_disk_path[BOOT_GUI_MAX_PATH - 1] = '\0';
+}
+
 const char* BootGUI_GetCDROMPath(void)
 {
     return selected_cdrom_path;

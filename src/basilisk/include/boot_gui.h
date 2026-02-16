@@ -40,6 +40,12 @@ void BootGUI_Run(void);
 const char* BootGUI_GetDiskPath(void);
 
 /*
+ *  Set the selected hard disk path
+ *  Pass nullptr or empty string to clear selection
+ */
+void BootGUI_SetDiskPath(const char* path);
+
+/*
  *  Get the selected CD-ROM path
  *  Returns pointer to static buffer with path (e.g., "/MacOS81.iso")
  *  Returns empty string if no CD-ROM selected
@@ -57,6 +63,11 @@ uint32_t BootGUI_GetRAMSize(void);
  *  Returns RAM size in MB (4, 8, 12, or 16)
  */
 int BootGUI_GetRAMSizeMB(void);
+
+/*
+ *  Set the selected RAM size in megabytes
+ */
+void BootGUI_SetRAMSizeMB(int size);
 
 /*
  *  Get the saved WiFi SSID
